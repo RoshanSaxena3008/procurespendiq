@@ -1,0 +1,27 @@
+[client]
+showErrorDetails = true
+showWarningOnDirectoryDelete = false
+maxUploadSize = 200
+
+[server]
+headless = true
+enableCORS = true
+enableXsrfProtection = false
+port = 8000
+maxMessageSize = 200
+
+[logger]
+level = "info"
+
+[theme]
+primaryColor = "#1f77b4"
+backgroundColor = "#ffffff"
+secondaryBackgroundColor = "#f0f2f6"
+textColor = "#262730"
+font = "sans serif"
+
+[browser]
+gatherUsageStats = false
+
+[runner]
+magicEnabled = true
