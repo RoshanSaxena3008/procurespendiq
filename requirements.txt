@@ -6,4 +6,5 @@ azure-identity==1.14.0
 openai==1.3.0
 pyyaml==6.0
 altair==5.0.0
-Fabric-snowpark-python==1.6.0
+requests==2.31.0
+python-dotenv==1.0.0
