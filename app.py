@@ -30,7 +30,7 @@ if not logger.handlers:
     logger.setLevel(logging.INFO)
 
 from config import Config
-from db_service import get_active_session, run_df, execute_query, execute_non_query, normalize_upper, run_warehouse_df, run_warehouse_non_query
+from db_service import get_active_session, run_df, execute_query, execute_non_query, normalize_upper, run_warehouse_df, run_warehouse_non_query, get_warehouse_connection
 from llm_service_full import generate_sql, cortex_complete, generate_prescriptive_insights, generate_ai_invoice_suggestion
 import altair as alt
 import urllib.parse
@@ -72,7 +72,7 @@ try:
         if _setup_errors:
             st.warning(f"Some warehouse tables could not be created: {_setup_errors}")
         
-        # ✅ RUN DATA VALIDATION ON STARTUP - Save results to DATA_VALIDATION_RESULTS
+        
         if "validation_run" not in st.session_state:
             try:
                 from data_validation import run_all_validations
@@ -3122,7 +3122,7 @@ def render_invoice_page():
                     """,
                     unsafe_allow_html=True,
                 )
-                 if clicked_pay:
+                if clicked_pay:
                     comp_code = st.session_state.get("_inv_pay_comp_code", "")
                     fisc_year = st.session_state.get("_inv_pay_fisc_year", "")
                     selected_inv = st.session_state.get("_inv_pay_invoice", "")
@@ -3165,7 +3165,7 @@ def render_invoice_page():
     else:
         # ---- Show all invoices by default when no search is performed ----
         st.markdown("### AllInvoices")
-        
+
         f_col1, f_col2, _ = st.columns([1.5, 1.5, 5], gap="medium")
         with f_col1:
             try:
