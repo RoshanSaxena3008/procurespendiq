@@ -3138,8 +3138,20 @@ def render_invoice_page():
                                         '{fisc_year.replace("'", "''")}'
                                 """)
                                 proc_result = ""
-                                if result is not None and not result.empty:
-                                    proc_result = str(result.iloc[0, 0])
+                                try:
+                                    result = run_df(exec_sql)
+                                    if result is not None and not result.empty:
+                                        proc_result = str(result.iloc[0, 0])
+                                except Exception:
+                                    proc_result = ""
+
+                                # If proc returned no explicit status, fall back to non-query execution
+                                if not proc_result:
+                                    try:
+                                        run_warehouse_non_query(exec_sql)
+                                        proc_result = "SUCCESS"   
+                                    except Exception as exec_err:
+                                        proc_result = f"ERROR: {exec_err}"
                                 if "SUCCESS" in proc_result.upper():
                                     st.session_state["inv_processed_set"] = st.session_state.get("inv_processed_set", set()) | {selected_inv}
                                     # Clear suggestion cache so invoice page shows updated status
