@@ -60,42 +60,46 @@ st.set_page_config(
 )
 
 # ---------- Fabric Session ----------
-try:
-    session = get_active_session()
-    # Smoke-test the connection immediately so errors surface clearly
-    session.sql("SELECT 1 AS probe").collect()
-    # Auto-create warehouse tables on first startup (safe to re-run)
-    if "warehouse_setup_done" not in st.session_state:
-        _setup_results = ensure_warehouse_tables()
-        st.session_state["warehouse_setup_done"] = True
-        _setup_errors = {k: v for k, v in _setup_results.items() if "error" in str(v)}
-        if _setup_errors:
-            st.warning(f"Some warehouse tables could not be created: {_setup_errors}")
-        
-        
+# Session object is created immediately (no network call — just builds the object).
+# All DB work is deferred until after Streamlit binds its port, so Azure's 230s
+# container warmup probe succeeds before any slow DB connection can time it out.
+session = get_active_session()
+
+if "startup_db_check_done" not in st.session_state:
+    st.session_state["startup_db_check_done"] = True
+    try:
+        session.sql("SELECT 1 AS probe").collect()
+
+        if "warehouse_setup_done" not in st.session_state:
+            try:
+                _setup_results = ensure_warehouse_tables()
+                st.session_state["warehouse_setup_done"] = True
+                _setup_errors = {k: v for k, v in _setup_results.items() if "error" in str(v)}
+                if _setup_errors:
+                    st.warning(f"Some warehouse tables could not be created: {_setup_errors}")
+            except Exception as _setup_err:
+                st.warning(f"Warehouse setup warning (non-blocking): {_setup_err}")
+                st.session_state["warehouse_setup_done"] = True
+
         if "validation_run" not in st.session_state:
             try:
                 from data_validation import run_all_validations
                 logger.info("Running startup data validation...")
                 validation_results = run_all_validations(persist=True)
                 st.session_state["validation_run"] = True
-                
-                # Log summary
                 passed = sum(1 for r in validation_results if r.status == "PASS")
                 failed = sum(1 for r in validation_results if r.status == "FAIL")
-                errors = sum(1 for r in validation_results if r.status == "ERROR")
+                errors  = sum(1 for r in validation_results if r.status == "ERROR")
                 logger.info(f"Validation complete: {passed} passed, {failed} failed, {errors} errors")
-                
             except Exception as validation_error:
                 logger.warning(f"Data validation failed (non-blocking): {validation_error}")
 
-except Exception as e:
-    err_str = str(e)
-    st.error("Database connection failed. Check the diagnostics below.")
-    # Detect the most common causes and give actionable guidance
-    if "Server is not found" in err_str or "connection to ." in err_str or "08001" in err_str:
-        st.markdown(
-            """
+    except Exception as e:
+        err_str = str(e)
+        st.error("Database connection failed. Check the diagnostics below.")
+        if "Server is not found" in err_str or "connection to ." in err_str or "08001" in err_str:
+            st.markdown(
+                """
 **Likely cause: FABRIC_SQL_SERVER is blank or unreachable.**
 
 Run this in your VS Code terminal to diagnose:
@@ -109,29 +113,28 @@ Common fixes:
    - Correct: `FABRIC_SQL_SERVER=server.fabric.microsoft.com`
    - Wrong:   `FABRIC_SQL_SERVER="server.fabric.microsoft.com"`
 3. Re-run `streamlit run app.py` after editing `.env`
-            """,
-            unsafe_allow_html=False,
-        )
-    elif "Login failed" in err_str or "18456" in err_str:
-        st.markdown(
-            """
+                """,
+                unsafe_allow_html=False,
+            )
+        elif "Login failed" in err_str or "18456" in err_str:
+            st.markdown(
+                """
 **Likely cause: Service Principal credentials are wrong.**
 
 Check `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, and `AZURE_CLIENT_SECRET` in your `.env` file.
-            """
-        )
-    elif "Login timeout" in err_str:
-        st.markdown(
-            """
+                """
+            )
+        elif "Login timeout" in err_str:
+            st.markdown(
+                """
 **Likely cause: Network / firewall is blocking the connection.**
 
 - Confirm you are on the corporate VPN or the Fabric workspace allows your IP.
 - Verify the server address ends with `.datawarehouse.fabric.microsoft.com`.
-            """
-        )
-    with st.expander("Full error details"):
-        st.code(err_str)
-    st.stop()
+                """
+            )
+        with st.expander("Full error details"):
+            st.code(err_str)
 
 # ---------- Your Fabric assets ----------
 # Fabric SQL Configuration (replacing Fabric)
