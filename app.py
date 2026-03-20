@@ -3132,7 +3132,7 @@ def render_invoice_page():
                                 # ✅ FIXED: Use EXEC instead of CALL for T-SQL stored procedures
                                 # Also don't use schema prefix in Fabric - just table name
                                 result = run_df(f"""
-                                    EXEC p_process_invoice_payment
+                                    EXEC {DB}.{SCHEMA}.p_process_invoice_payment
                                         '{selected_inv.replace("'", "''")}',
                                         '{comp_code.replace("'", "''")}',
                                         '{fisc_year.replace("'", "''")}'
