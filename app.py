@@ -3129,32 +3129,25 @@ def render_invoice_page():
                     if comp_code and fisc_year:
                         with st.spinner("Processing payment…"):
                             try:
-                                # ✅ FIXED: Use EXEC instead of CALL for T-SQL stored procedures
-                                # Also don't use schema prefix in Fabric - just table name
-                                result = run_df(f"""
-                                    EXEC {DB}.{SCHEMA}.p_process_invoice_payment
-                                        '{selected_inv.replace("'", "''")}',
-                                        '{comp_code.replace("'", "''")}',
-                                        '{fisc_year.replace("'", "''")}'
-                                """)
-                                proc_result = ""
-                                try:
-                                    result = run_df(exec_sql)
-                                    if result is not None and not result.empty:
-                                        proc_result = str(result.iloc[0, 0])
-                                except Exception:
-                                    proc_result = ""
+                                inv_esc  = selected_inv.replace("'", "''")
+                                comp_esc = comp_code.replace("'", "''")
+                                year_esc = fisc_year.replace("'", "''")
+                                exec_sql = (
+                                    f"EXEC {DB}.{SCHEMA}.p_process_invoice_payment "
+                                    f"'{inv_esc}', '{comp_esc}', '{year_esc}'"
+                                )
 
-                                # If proc returned no explicit status, fall back to non-query execution
-                                if not proc_result:
-                                    try:
-                                        run_warehouse_non_query(exec_sql)
-                                        proc_result = "SUCCESS"   
-                                    except Exception as exec_err:
-                                        proc_result = f"ERROR: {exec_err}"
+                                rows = session.sql(exec_sql).collect()
+
+
+                                proc_result = "SUCCESS"
+                                if rows:
+                                    first_val = str(rows[0][0]) if rows[0] else ""
+                                    if first_val:
+                                        proc_result = first_val
+
                                 if "SUCCESS" in proc_result.upper():
                                     st.session_state["inv_processed_set"] = st.session_state.get("inv_processed_set", set()) | {selected_inv}
-                                    # Clear suggestion cache so invoice page shows updated status
                                     st.session_state.get("inv_ai_suggestion_cache", {}).pop(selected_inv, None)
                                     st.session_state.pop("_inv_pay_status", None)
                                     st.session_state.pop("_inv_pay_invoice", None)
@@ -3173,7 +3166,7 @@ def render_invoice_page():
     else:
         # ---- Show all invoices by default when no search is performed ----
         st.markdown("### AllInvoices")
-
+        
         f_col1, f_col2, _ = st.columns([1.5, 1.5, 5], gap="medium")
         with f_col1:
             try:
