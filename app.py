@@ -3122,7 +3122,7 @@ def render_invoice_page():
                     """,
                     unsafe_allow_html=True,
                 )
-                if clicked_pay:
+                 if clicked_pay:
                     comp_code = st.session_state.get("_inv_pay_comp_code", "")
                     fisc_year = st.session_state.get("_inv_pay_fisc_year", "")
                     selected_inv = st.session_state.get("_inv_pay_invoice", "")
@@ -3137,26 +3137,25 @@ def render_invoice_page():
                                     f"'{inv_esc}', '{comp_esc}', '{year_esc}'"
                                 )
 
-                                rows = session.sql(exec_sql).collect()
+                                # session.sql().collect() and run_df() both ultimately call
+                                # cursor.fetchall() which raises "No results. Previous SQL was
+                                # not a query." for any EXEC/non-SELECT statement.
+                                # We must use a raw pyodbc cursor via get_warehouse_connection()
+                                # and commit manually — never calling fetchall().
+                                _wh_conn = get_warehouse_connection()
+                                _cursor = _wh_conn.cursor()
+                                _cursor.execute(exec_sql)
+                                _wh_conn.commit()
+                                _cursor.close()
 
-
-                                proc_result = "SUCCESS"
-                                if rows:
-                                    first_val = str(rows[0][0]) if rows[0] else ""
-                                    if first_val:
-                                        proc_result = first_val
-
-                                if "SUCCESS" in proc_result.upper():
-                                    st.session_state["inv_processed_set"] = st.session_state.get("inv_processed_set", set()) | {selected_inv}
-                                    st.session_state.get("inv_ai_suggestion_cache", {}).pop(selected_inv, None)
-                                    st.session_state.pop("_inv_pay_status", None)
-                                    st.session_state.pop("_inv_pay_invoice", None)
-                                    st.session_state.pop("_inv_pay_comp_code", None)
-                                    st.session_state.pop("_inv_pay_fisc_year", None)
-                                    st.success("Invoice processed successfully. Status updated to Paid in all tables.")
-                                    st.rerun()
-                                else:
-                                    st.error(f"Processing failed: {proc_result}")
+                                st.session_state["inv_processed_set"] = st.session_state.get("inv_processed_set", set()) | {selected_inv}
+                                st.session_state.get("inv_ai_suggestion_cache", {}).pop(selected_inv, None)
+                                st.session_state.pop("_inv_pay_status", None)
+                                st.session_state.pop("_inv_pay_invoice", None)
+                                st.session_state.pop("_inv_pay_comp_code", None)
+                                st.session_state.pop("_inv_pay_fisc_year", None)
+                                st.success("Invoice processed successfully. Status updated to Paid in all tables.")
+                                st.rerun()
                             except Exception as e:
                                 st.error(f"Error processing invoice: {e}")
                     else:
