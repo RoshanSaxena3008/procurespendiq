@@ -1,5 +1,5 @@
 """
-Configuration settings for ProcureSpendIQ Analytics
+Configuration settings for ProcureIQ Analytics
 Secrets are sourced from Azure Key Vault. All UI strings and
 operational tunables are loaded from app_settings.yaml so that
 the codebase never contains hard-coded values.
@@ -126,7 +126,7 @@ class Config:
     )
     FABRIC_DATABASE: str = _vault.get(
         "FABRIC_DATABASE",
-        _settings.get("fabric", {}).get("database", "LH_PROCURE_SPEND_IQ"),
+        _settings.get("fabric", {}).get("database", "LH_PROCURE_IQ"),
     )
 
     # Warehouse (read + write: history, insights, cache)
@@ -138,7 +138,7 @@ class Config:
     )
     FABRIC_WAREHOUSE_DATABASE: str = _vault.get(
         "FABRIC_WAREHOUSE_DATABASE",
-        _settings.get("fabric", {}).get("warehouse_database", "WH_PROCURE_SPEND_IQ"),
+        _settings.get("fabric", {}).get("warehouse_database", "WH_PROCURE_IQ"),
     )
 
     # Schema names
@@ -181,10 +181,10 @@ class Config:
     # ------------------------------------------------------------------
     _ui = _settings.get("ui", {})
 
-    APP_TITLE: str        = _ui.get("app_title", "ProcureSpendIQ Analytics")
+    APP_TITLE: str        = _ui.get("app_title", "ProcureIQ Analytics")
     PAGE_ICON_URL: str    = _ui.get("page_icon_url", "")
     DEFAULT_BG_COLOR: str = _ui.get("default_bg_color", "#FBF9F4")
-    BRAND_NAME: str       = _ui.get("brand_name", "ProcureSpendIQ")
+    BRAND_NAME: str       = _ui.get("brand_name", "ProcureIQ")
     SUPPORT_EMAIL: str    = _ui.get("support_email", "")
     APP_REGION: str       = _ui.get("region", "eastus")
 
@@ -213,13 +213,32 @@ class Config:
     )
 
     # ------------------------------------------------------------------
-    # Feature flags
+    # Contextual Memory Settings for Genie (NEW)
     # ------------------------------------------------------------------
+    _memory = _settings.get("genie_memory", {})
+    
+    # Short-term memory: session-based context
+    SHORT_TERM_MEMORY_ENABLED: bool = _memory.get("short_term_enabled", True)
+    SHORT_TERM_MEMORY_MAX_MESSAGES: int = _memory.get("short_term_max_messages", 20)
+    SHORT_TERM_MEMORY_WINDOW_MINUTES: int = _memory.get("short_term_window_minutes", 60)
+    
+    # Long-term memory: persistent context stored in database
+    LONG_TERM_MEMORY_ENABLED: bool = _memory.get("long_term_enabled", True)
+    LONG_TERM_MEMORY_TABLE: str = _memory.get(
+        "long_term_table", "dbo.genie_context_memory"
+    )
+    LONG_TERM_MEMORY_MAX_CONTEXTS: int = _memory.get("long_term_max_contexts", 100)
+    
+    # Context window size for LLM (tokens)
+    GENIE_CONTEXT_WINDOW_SIZE: int = _memory.get("context_window_size", 4000)
+    
+    # Feature flags
     _features = _settings.get("features", {})
     ENABLE_GENIE_HISTORY: bool = _features.get("genie_history", True)
     ENABLE_INSIGHTS_SAVE: bool = _features.get("insights_save", True)
     ENABLE_DATA_VAULT_AI: bool = _features.get("data_vault_ai", True)
     ENABLE_AUTO_YAML: bool     = _features.get("auto_yaml_update", True)
+    ENABLE_CONTEXTUAL_MEMORY: bool = _features.get("contextual_memory", True)
 
     # ------------------------------------------------------------------
     # Auto-suspend (req 14)
@@ -238,6 +257,19 @@ class Config:
     HISTORY_TABLE_NAME: str    = _naming.get("history_table", "GENIE_QUESTION_HISTORY")
     SAVED_INSIGHTS_TABLE: str  = _naming.get("saved_insights_table", "SAVED_INSIGHTS")
     CACHE_TABLE_NAME: str      = _naming.get("cache_table", "QUERY_RESULT_CACHE")
+    CONTEXT_MEMORY_TABLE: str  = _naming.get("context_memory_table", "GENIE_CONTEXT_MEMORY")
+
+    # ------------------------------------------------------------------
+    # UI/Theme Configuration
+    # ------------------------------------------------------------------
+    _theme = _settings.get("theme", {})
+    PRIMARY_COLOR: str = _theme.get("primary_color", "#667eea")
+    SECONDARY_COLOR: str = _theme.get("secondary_color", "#764ba2")
+    SUCCESS_COLOR: str = _theme.get("success_color", "#28a745")
+    WARNING_COLOR: str = _theme.get("warning_color", "#ffc107")
+    DANGER_COLOR: str = _theme.get("danger_color", "#dc3545")
+    INFO_COLOR: str = _theme.get("info_color", "#17a2b8")
+    LIGHT_BG_COLOR: str = _theme.get("light_bg_color", "#f8f9fa")
 
     # ------------------------------------------------------------------
     # Validation
@@ -285,12 +317,16 @@ class Config:
         lines.append(f"AZURE_CLIENT_SECRET      : {mask(cls.AZURE_CLIENT_SECRET)}")
         lines.append(f"AZURE_OPENAI_ENDPOINT    : {cls.AZURE_OPENAI_ENDPOINT or '(NOT SET)'}")
         lines.append(f"AZURE_OPENAI_DEPLOYMENT  : {cls.AZURE_OPENAI_DEPLOYMENT or '(NOT SET)'}")
+        lines.append(f"\nContextual Memory Settings:")
+        lines.append(f"SHORT_TERM_MEMORY_ENABLED: {cls.SHORT_TERM_MEMORY_ENABLED}")
+        lines.append(f"LONG_TERM_MEMORY_ENABLED : {cls.LONG_TERM_MEMORY_ENABLED}")
+        lines.append(f"GENIE_CONTEXT_WINDOW_SIZE: {cls.GENIE_CONTEXT_WINDOW_SIZE} tokens")
         return lines
 
     @classmethod
     def print_diagnostics(cls) -> None:
         """Print masked config values to the terminal for quick troubleshooting."""
-        print("\n=== ProcureSpendIQ Configuration Diagnostics ===")
+        print("\n=== ProcureIQ Configuration Diagnostics ===")
         for line in cls.validate_connection_values():
             print(" ", line)
         missing = [
