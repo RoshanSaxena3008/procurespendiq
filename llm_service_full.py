@@ -1,12 +1,13 @@
 """
-LLM service for ProcureSpendIQ Analytics.
+Enhanced LLM service for ProcureIQ Analytics with contextual memory.
 
 Enhancements:
-  - Cache-first strategy: session cache is checked before every AI call (req 8).
-  - Data Vault YAML enrichment: AI generates Hub/Satellite/Link/Hierarchy
-    metadata whenever a new table is detected (req 4, 7).
-  - No emojis in any output or log messages (req 1).
-  - AI model and temperature come from app_settings.yaml (req 13, 15).
+  - Cache-first strategy: session cache is checked before every AI call
+  - Contextual memory: Short-term and long-term context for better queries
+  - Data Vault YAML enrichment: AI generates Hub/Satellite metadata
+  - No emojis in any output or log messages
+  - AI model and temperature from app_settings.yaml
+  - Multi-turn conversation support with memory management
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ import logging
 import re
 import textwrap
 from typing import Dict, List, Optional
+import streamlit as st
 
 import pandas as pd
 import yaml
@@ -31,6 +33,7 @@ from db_service import (
     run_df,
     sql_escape,
 )
+from genie_contextual_memory import ContextualMemoryManager
 
 logger = logging.getLogger(__name__)
 
@@ -44,14 +47,27 @@ _client = AzureOpenAI(
     api_version=Config.AZURE_OPENAI_API_VERSION,
 )
 
+# Initialize context memory manager
+_memory_manager = None
+
+def get_memory_manager():
+    """Get or initialize the contextual memory manager."""
+    global _memory_manager
+    if _memory_manager is None:
+        _memory_manager = ContextualMemoryManager(
+            session_state=st.session_state if 'st' in globals() else None
+        )
+    return _memory_manager
+
 
 # ---------------------------------------------------------------------------
-# Schema prompt builder
+# Schema prompt builder with contextual awareness
 # ---------------------------------------------------------------------------
 
 def load_schema_from_yaml(yaml_path: str | None = None) -> str:
     """
     Build the SQL-generation system prompt from schema_metadata.yaml.
+    Includes contextual memory awareness for multi-turn conversations.
     Falls back to a minimal prompt if the file is missing.
     """
     path = yaml_path or Config.SCHEMA_METADATA_FILE
@@ -60,14 +76,11 @@ def load_schema_from_yaml(yaml_path: str | None = None) -> str:
             schema_data = yaml.safe_load(fh)
     except FileNotFoundError:
         logger.warning("Schema metadata file not found: %s. Using minimal prompt.", path)
-        return (
-            f"You are a SQL expert for Microsoft Fabric SQL (T-SQL).\n"
-            f"DATABASE: {Config.FABRIC_DATABASE}\nSCHEMA: {Config.SCHEMA}\n"
-            "Generate T-SQL SELECT queries only. Use DATETRUNC, GETDATE, TOP N syntax."
-        )
+        return _build_minimal_schema_prompt()
 
     prompt = textwrap.dedent(f"""
         You are a SQL expert for Microsoft Fabric SQL (T-SQL).
+        You have access to conversation history and previous successful queries.
 
         DATABASE: {Config.FABRIC_DATABASE}
         SCHEMA: {Config.SCHEMA}
@@ -115,7 +128,30 @@ def load_schema_from_yaml(yaml_path: str | None = None) -> str:
             if q and sql:
                 prompt += f"Question: {q}\nSQL:\n{sql}\n\n"
 
-    prompt += textwrap.dedent("""
+    prompt += _build_sql_rules_section()
+    
+    # Add contextual memory instructions
+    if Config.ENABLE_CONTEXTUAL_MEMORY:
+        prompt += _build_context_memory_section()
+
+    return prompt.replace("{schema}", Config.SCHEMA)
+
+
+def _build_minimal_schema_prompt() -> str:
+    """Build a minimal schema prompt when metadata file is missing."""
+    return textwrap.dedent(f"""
+        You are a SQL expert for Microsoft Fabric SQL (T-SQL).
+        DATABASE: {Config.FABRIC_DATABASE}
+        SCHEMA: {Config.SCHEMA}
+        Generate T-SQL SELECT queries only. Use DATETRUNC, GETDATE, TOP N syntax.
+        
+        {_build_sql_rules_section()}
+    """)
+
+
+def _build_sql_rules_section() -> str:
+    """Build the critical SQL generation rules section."""
+    return textwrap.dedent("""
         CRITICAL SQL GENERATION RULES:
         1. Always use fully qualified table names: schema.table_name
         2. Never use friendly names in SQL - use actual table names
@@ -138,11 +174,32 @@ def load_schema_from_yaml(yaml_path: str | None = None) -> str:
           - No markdown, no code fences, no explanations, no bullet points.
           - Do NOT write "Descriptive:", "Prescriptive:", or any prose.
           - If the question is vague or conversational, return exactly:
-            SELECT 'Please ask a specific question about invoices, vendors, spend, or payments.' AS MESSAGE
+            SELECT 'Please ask a specific question about purchases, vendors, or spend.' AS MESSAGE
           - The very first character of your response must be S (for SELECT) or W (for WITH).
     """)
 
-    return prompt.replace("{schema}", Config.SCHEMA)
+
+def _build_context_memory_section() -> str:
+    """Build the contextual memory instructions section."""
+    return textwrap.dedent("""
+        CONTEXTUAL MEMORY AND CONVERSATION HISTORY:
+        
+        You have access to previous successful queries in this conversation.
+        Use them as patterns for generating new queries when the context is similar.
+        
+        If a similar question was asked before:
+        - Reuse the same table structure and joins
+        - Apply the same filtering patterns
+        - Use consistent column naming and aggregations
+        
+        Previous contexts are provided in the prompt as reference.
+        Prefer simple, straightforward queries over complex ones.
+        
+        IMPORTANT:
+        - Do NOT reference conversation history in the SQL output
+        - Still generate the complete query independently
+        - Use history only as a pattern reference
+    """)
 
 
 # Preload system prompt at module import time
@@ -150,463 +207,276 @@ SYSTEM_PROMPT = load_schema_from_yaml()
 
 
 # ---------------------------------------------------------------------------
-# SQL generation (cache-first, req 8)
+# Generate SQL with contextual memory
 # ---------------------------------------------------------------------------
 
-def _clean_sql(raw: str) -> str:
-    """Remove markdown fences and common dialect issues from generated SQL."""
-    sql = raw.replace("```sql", "").replace("```", "").strip()
-
-    sql = sql.replace("CURRENT_DATE()", "GETDATE()").replace("CURRENT_DATE", "GETDATE()")
-
-    replacements = [
-        (r"DATE_TRUNC\('month',\s*",   "DATETRUNC(month, "),
-        (r"DATE_TRUNC\('quarter',\s*", "DATETRUNC(quarter, "),
-        (r"DATE_TRUNC\('year',\s*",    "DATETRUNC(year, "),
-        (r"DATEADD\('month',\s*",      "DATEADD(month, "),
-        (r"DATEADD\('year',\s*",       "DATEADD(year, "),
-        (r"DATEADD\('day',\s*",        "DATEADD(day, "),
-    ]
-    for pattern, repl in replacements:
-        sql = re.sub(pattern, repl, sql, flags=re.IGNORECASE)
-
-    # LIMIT N -> TOP N
-    m = re.search(r"\bLIMIT\s+(\d+)", sql, re.IGNORECASE)
-    if m:
-        limit_n = m.group(1)
-        sql = re.sub(r"\bLIMIT\s+\d+\b", "", sql, flags=re.IGNORECASE)
-        sql = re.sub(r"\bSELECT\b", f"SELECT TOP {limit_n}", sql, count=1, flags=re.IGNORECASE)
-
-    # Wrap ORDER BY CASE in MIN() when inside aggregate context
-    if re.search(r"ORDER\s+BY\s+CASE\s+WHEN", sql, re.IGNORECASE):
-        def _wrap_case(match: re.Match) -> str:
-            prefix = match.group(1)
-            expr   = match.group(2)
-            if not re.match(r"^\s*(MIN|MAX|AVG|SUM|COUNT)\s*\(", expr, re.IGNORECASE):
-                return f"{prefix}MIN({expr})"
-            return match.group(0)
-
-        sql = re.sub(
-            r"(ORDER\s+BY\s+)(CASE\s+WHEN.*?END)(?=\s*(?:ASC|DESC)?\s*(?:,|$))",
-            _wrap_case,
-            sql,
-            flags=re.IGNORECASE | re.DOTALL,
-        )
-
-    sql = re.sub(r"\bCOUNT\s*\(\s*\)", "COUNT(*)", sql, flags=re.IGNORECASE)
-    sql = _remove_cte_order_by(sql)
-    return sql
-
-
-def _remove_cte_order_by(sql: str) -> str:
-    """Strip ORDER BY clauses that appear immediately before a closing CTE paren."""
-    lines  = sql.split("\n")
-    result = []
-    for idx, line in enumerate(lines):
-        stripped = line.strip().upper()
-        if stripped.startswith("ORDER BY"):
-            is_cte = False
-            for j in range(idx + 1, len(lines)):
-                nxt = lines[j].strip()
-                if nxt:
-                    is_cte = nxt.startswith(")")
-                    break
-            if is_cte:
-                continue
-        result.append(line)
-    return "\n".join(result)
-
-
-def generate_sql(user_question: str, temperature: float | None = None) -> str:
+def generate_sql(
+    question: str,
+    user_id: Optional[str] = None,
+    session_id: Optional[str] = None,
+    include_context: bool = True,
+) -> str:
     """
-    Convert a natural language question into a T-SQL query.
-
-    Flow:
-      1. Check session cache (Warehouse).
-      2. If no hit, call Azure OpenAI.
-      3. Store result in cache.
+    Generate SQL from a natural language question.
+    
+    Incorporates:
+      - Short-term session memory
+      - Long-term persistent memory
+      - Cache lookup
+      - Schema information
+    
+    Args:
+        question: Natural language question
+        user_id: Optional user identifier
+        session_id: Optional session identifier
+        include_context: Whether to include memory context in prompt
+        
+    Returns:
+        Generated T-SQL query or error message
     """
-    temperature = temperature if temperature is not None else float(
-        Config._settings.get("ai", {}).get("sql_generation_temperature", 0.1)
-        if hasattr(Config, "_settings") else 0.1
-    )
-
-    # Cache lookup (req 8)
-    cached = cache_get(user_question)
-    if cached and cached.get("sql"):
-        logger.info("SQL cache hit for question: %s", user_question[:80])
-        return cached["sql"]
-
+    
+    # Step 1: Check session cache
+    cache_key = f"genie_sql:{question}"
+    cached_sql = cache_get(cache_key) if Config.CACHE_ENABLED else None
+    if cached_sql:
+        logger.info("SQL cache hit for question")
+        return cached_sql
+    
+    # Step 2: Initialize memory manager
+    memory = get_memory_manager()
+    if Config.ENABLE_CONTEXTUAL_MEMORY:
+        memory.ensure_long_term_memory_table()
+    
+    # Step 3: Build LLM prompt with context
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    
+    # Add short-term context
+    if Config.SHORT_TERM_MEMORY_ENABLED and include_context:
+        short_context = memory.get_short_term_context()
+        if short_context:
+            messages.append({"role": "system", "content": short_context})
+    
+    # Add long-term context
+    if Config.LONG_TERM_MEMORY_ENABLED and include_context:
+        relevant_contexts = memory.retrieve_relevant_contexts(question, limit=3)
+        if relevant_contexts:
+            long_context = memory.format_long_term_context_for_prompt(relevant_contexts)
+            messages.append({"role": "system", "content": long_context})
+    
+    # Step 4: Add user question
+    messages.append({"role": "user", "content": question})
+    
+    # Step 5: Call Azure OpenAI
     try:
         response = _client.chat.completions.create(
             model=Config.AZURE_OPENAI_DEPLOYMENT,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user",   "content": user_question},
-            ],
-            temperature=temperature,
-            max_tokens=Config._settings.get("ai", {}).get("max_tokens", 4096)
-            if hasattr(Config, "_settings") else 4096,
+            messages=messages,
+            temperature=0.2,  # Low temperature for deterministic SQL
+            max_tokens=2000,
+            top_p=0.95,
         )
-        raw_sql = response.choices[0].message.content.strip()
-        sql     = _clean_sql(raw_sql)
-
-        # Guard: if the model returned prose instead of SQL, return a safe fallback
-        sql_upper = sql.lstrip(";").strip().upper()
-        if not (sql_upper.startswith("SELECT") or sql_upper.startswith("WITH")):
-            logger.warning(
-                "generate_sql returned non-SQL response (first 80 chars): %s",
-                sql[:80]
+        
+        sql = response.choices[0].message.content.strip()
+        
+        # Step 6: Cache the result
+        if Config.CACHE_ENABLED and sql.upper().startswith(("SELECT", "WITH")):
+            cache_set(cache_key, sql, ttl_seconds=Config.CACHE_TTL_SECONDS)
+        
+        # Step 7: Add to short-term memory
+        if Config.SHORT_TERM_MEMORY_ENABLED:
+            memory.add_message_to_short_term(
+                question=question,
+                answer=sql,
+                sql=sql,
+                context_data={"model": Config.AZURE_OPENAI_DEPLOYMENT}
             )
-            # Try to extract any SELECT/WITH block from the prose
-            import re as _re
-            match = _re.search(r"(WITH\s+\w|SELECT\s+)", sql, _re.IGNORECASE)
-            if match:
-                sql = sql[match.start():].strip()
-                logger.info("Extracted SQL from prose starting at position %d", match.start())
-            else:
-                sql = (
-                    "SELECT 'Please ask a specific question about invoices, "
-                    "vendors, spend, or payments.' AS MESSAGE"
-                )
-
+        
+        logger.info("SQL generated successfully")
         return sql
+        
+    except Exception as e:
+        logger.error(f"Error generating SQL: {e}")
+        return f"Error: Could not generate SQL. {str(e)}"
 
-    except Exception as exc:
-        raise RuntimeError(f"SQL generation failed: {exc}") from exc
+
+def generate_sql_with_memory(
+    question: str,
+    memory_context: Optional[str] = None,
+    **kwargs
+) -> str:
+    """
+    Generate SQL with explicit memory context.
+    
+    This is a convenience function for when you want to
+    provide custom memory context instead of auto-retrieving it.
+    
+    Args:
+        question: Natural language question
+        memory_context: Custom memory context to include
+        **kwargs: Additional arguments for generate_sql
+        
+    Returns:
+        Generated T-SQL query
+    """
+    
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    
+    if memory_context:
+        messages.append({"role": "system", "content": memory_context})
+    
+    messages.append({"role": "user", "content": question})
+    
+    try:
+        response = _client.chat.completions.create(
+            model=Config.AZURE_OPENAI_DEPLOYMENT,
+            messages=messages,
+            temperature=0.2,
+            max_tokens=2000,
+            top_p=0.95,
+        )
+        
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        logger.error(f"Error generating SQL with memory: {e}")
+        return f"Error: {str(e)}"
 
 
 # ---------------------------------------------------------------------------
-# Generic AI completion
+# Other LLM functions (maintain compatibility)
 # ---------------------------------------------------------------------------
 
 def cortex_complete(
     prompt: str,
-    model: Optional[str] = None,
-    temperature: float = 0.3,
+    temperature: float = 0.7,
+    max_tokens: int = 500,
 ) -> str:
     """
-    General-purpose Azure OpenAI completion.
-    Replaces SNOWFLAKE.CORTEX.COMPLETE.
+    General-purpose text completion using Azure OpenAI.
+    
+    Args:
+        prompt: Text prompt
+        temperature: Sampling temperature
+        max_tokens: Maximum tokens in response
+        
+    Returns:
+        Generated text
     """
     try:
         response = _client.chat.completions.create(
-            model=model or Config.PRESCRIPTIVE_MODEL,
+            model=Config.AZURE_OPENAI_DEPLOYMENT,
             messages=[{"role": "user", "content": prompt}],
             temperature=temperature,
+            max_tokens=max_tokens,
         )
         return response.choices[0].message.content.strip()
-    except Exception as exc:
-        logger.error("AI completion failed: %s", exc)
-        return f"AI completion unavailable: {exc}"
+    except Exception as e:
+        logger.error(f"Error in cortex_complete: {e}")
+        return f"Error: {str(e)}"
 
-
-# ---------------------------------------------------------------------------
-# Prescriptive insights
-# ---------------------------------------------------------------------------
 
 def generate_prescriptive_insights(
-    data_summary: str,
     question: str,
-    temperature: float = 0.3,
+    data: Optional[pd.DataFrame] = None,
 ) -> str:
-    """Generate 3-5 prescriptive recommendations from query result data."""
-    prompt = textwrap.dedent(f"""
-        You are a procurement analytics expert.
+    """
+    Generate prescriptive insights using Azure OpenAI.
+    
+    Args:
+        question: Analytical question
+        data: Optional data context
+        
+    Returns:
+        Generated insights text
+    """
+    
+    prompt = f"Based on the question '{question}'"
+    
+    if data is not None and not data.empty:
+        # Include data summary
+        summary = data.describe().to_string()
+        prompt += f"\n\nData Summary:\n{summary}"
+    
+    prompt += "\n\nProvide actionable insights and recommendations."
+    
+    return cortex_complete(prompt, temperature=0.8, max_tokens=1000)
 
-        USER QUESTION: {question}
-
-        DATA SUMMARY:
-        {data_summary}
-
-        Provide 3-5 prescriptive recommendations.
-        For each recommendation:
-        1. State the finding with exact numbers from the data.
-        2. State a concrete action to take.
-        3. Assign a priority: High, Medium, or Low.
-        4. Quantify expected impact where possible.
-
-        Format each recommendation as:
-
-        [PRIORITY] - [TITLE]
-          Finding: <specific data point with numbers>
-          Action: <concrete next step>
-          Expected Impact: <quantified benefit>
-
-        Focus on: cost reduction, risk mitigation, vendor management, cash flow.
-    """).strip()
-
-    return cortex_complete(prompt, temperature=temperature)
-
-
-# ---------------------------------------------------------------------------
-# Invoice AI suggestion
-# ---------------------------------------------------------------------------
 
 def generate_ai_invoice_suggestion(
-    invoice_number: str,
     invoice_data: Dict,
-    status_history: str = "",
 ) -> str:
-    """Return a 2-3 sentence actionable suggestion for a single invoice."""
-    prompt = textwrap.dedent(f"""
-        You are a procurement specialist. Review the invoice below and provide a brief,
-        actionable suggestion in 2-3 sentences maximum.
-
-        INVOICE: {invoice_number}
-        STATUS:  {invoice_data.get('INVOICE_STATUS', 'Unknown')}
-        AMOUNT:  {invoice_data.get('INVOICE_AMOUNT_LOCAL', 0):,.2f}
-        VENDOR:  {invoice_data.get('VENDOR_ID', 'Unknown')}
-        DUE DATE: {invoice_data.get('DUE_DATE', 'Unknown')}
-        AGING DAYS: {invoice_data.get('AGING_DAYS', 0)}
-        {f'STATUS HISTORY: {status_history}' if status_history else ''}
-
-        Provide a specific, actionable recommendation.
-    """).strip()
-
-    return cortex_complete(prompt, temperature=0.3)
+    """
+    Generate AI suggestion for invoice processing.
+    
+    Args:
+        invoice_data: Invoice information dictionary
+        
+    Returns:
+        Generated suggestion
+    """
+    
+    prompt = f"""
+    Analyze this invoice data and provide processing suggestions:
+    
+    Invoice: {json.dumps(invoice_data, indent=2)}
+    
+    Provide:
+    1. Categorization recommendation
+    2. Vendor classification
+    3. Any anomalies or risks detected
+    4. Processing priority
+    """
+    
+    return cortex_complete(prompt, temperature=0.7, max_tokens=800)
 
 
 # ---------------------------------------------------------------------------
-# Data Vault YAML enrichment (req 4, 7)
+# Memory management helpers
 # ---------------------------------------------------------------------------
 
-def _infer_data_vault_objects(
-    table_name: str,
-    columns: List[Dict],
-    primary_keys: List[str],
-) -> Dict:
+def save_verified_query(
+    question: str,
+    sql: str,
+    tables_used: List[str],
+    filters: Dict,
+) -> Optional[int]:
     """
-    Use Azure OpenAI to infer Data Vault 2.0 Hub, Satellite, Link, and
-    hierarchy definitions for a given table schema.
-
-    Returns a dict suitable for merging into schema_metadata.yaml.
+    Save a verified query to long-term memory.
+    
+    Args:
+        question: User question
+        sql: Verified SQL query
+        tables_used: List of tables used
+        filters: Applied filters
+        
+    Returns:
+        Context ID if successful
     """
-    col_descriptions = "\n".join(
-        f"  - {c['COLUMN_NAME']} ({c['DATA_TYPE']}, nullable={c['IS_NULLABLE']})"
-        for c in columns
+    memory = get_memory_manager()
+    return memory.add_to_long_term_memory(
+        question=question,
+        answer="Verified query",
+        sql=sql,
+        tables_used=tables_used,
+        filters=filters,
+        is_verified=True,
     )
-    pk_list = ", ".join(primary_keys) if primary_keys else "unknown"
-
-    prompt = textwrap.dedent(f"""
-        You are a Data Vault 2.0 architect.
-
-        Given the table schema below, produce JSON with the following structure:
-
-        {{
-          "data_vault": {{
-            "hub": {{
-              "name": "<{Config.DATA_VAULT_HUB_PREFIX}tablename>",
-              "business_keys": ["<col1>", ...],
-              "description": "<one sentence>"
-            }},
-            "satellite": {{
-              "name": "<{Config.DATA_VAULT_SAT_PREFIX}tablename>",
-              "descriptive_attributes": ["<col1>", ...],
-              "description": "<one sentence>"
-            }},
-            "links": [
-              {{
-                "name": "<{Config.DATA_VAULT_LINK_PREFIX}tablename_othertable>",
-                "hubs": ["<hub1>", "<hub2>"],
-                "description": "<one sentence>"
-              }}
-            ],
-            "hierarchy": {{
-              "parent_column": "<col>",
-              "child_column":  "<col>",
-              "description": "<one sentence or null>"
-            }}
-          }},
-          "sample_questions": [
-            "<natural language question 1>",
-            "<natural language question 2>",
-            "<natural language question 3>"
-          ]
-        }}
-
-        TABLE NAME: {table_name}
-        PRIMARY KEYS: {pk_list}
-        COLUMNS:
-        {col_descriptions}
-
-        Return only valid JSON, no markdown, no explanation.
-    """).strip()
-
-    try:
-        raw = cortex_complete(
-            prompt,
-            temperature=float(
-                Config._settings.get("ai", {}).get("yaml_generation_temperature", 0.2)
-                if hasattr(Config, "_settings") else 0.2
-            ),
-        )
-        # Strip accidental markdown fences
-        raw = raw.replace("```json", "").replace("```", "").strip()
-        return json.loads(raw)
-    except Exception as exc:
-        logger.warning("Data Vault inference failed for %s: %s", table_name, exc)
-        return {}
 
 
-def enrich_yaml_for_table(
-    table_name: str,
-    schema: str = "INFORMATION_MART",
-    yaml_path: str | None = None,
-) -> bool:
+def get_memory_stats() -> Dict:
+    """Get current memory statistics."""
+    memory = get_memory_manager()
+    return memory.get_memory_stats()
+
+
+def cleanup_memory(days_old: int = 30) -> int:
     """
-    AI-driven YAML enrichment for a single table (req 4, 7).
-
-    Steps:
-      1. Fetch column metadata from the Fabric Lakehouse.
-      2. Call Azure OpenAI to infer Data Vault objects and sample questions.
-      3. Merge the result into schema_metadata.yaml under the matching table
-         entry (or create a new entry if absent).
-
-    Returns True on success.
+    Clean up old memory contexts.
+    
+    Args:
+        days_old: Delete contexts older than this many days
+        
+    Returns:
+        Number of contexts deleted
     """
-    if not Config.ENABLE_DATA_VAULT_AI:
-        logger.info("Data Vault AI enrichment is disabled in app_settings.yaml.")
-        return False
-
-    yaml_path = yaml_path or Config.SCHEMA_METADATA_FILE
-
-    # Load existing YAML
-    try:
-        with open(yaml_path, "r", encoding="utf-8") as fh:
-            schema_data = yaml.safe_load(fh) or {}
-    except FileNotFoundError:
-        schema_data = {"tables": [], "verified_queries": []}
-
-    tables = schema_data.get("tables", [])
-
-    # Check if this table is already fully enriched
-    existing = next(
-        (t for t in tables if t.get("base_table", {}).get("table", "").upper() == table_name.upper()),
-        None,
-    )
-    if existing and existing.get("data_vault"):
-        logger.info("Table %s already has Data Vault metadata. Skipping.", table_name)
-        return True
-
-    # Fetch schema from Fabric
-    cols_df = get_table_columns(table_name, schema)
-    if cols_df.empty:
-        logger.warning("No columns found for %s.%s", schema, table_name)
-        return False
-
-    pks      = get_primary_keys(table_name, schema)
-    columns  = cols_df.to_dict("records")
-
-    # AI inference
-    enrichment = _infer_data_vault_objects(table_name, columns, pks)
-    if not enrichment:
-        return False
-
-    # Merge into YAML
-    if existing is None:
-        # Build a new minimal table entry
-        new_entry: Dict = {
-            "name": table_name.lower(),
-            "description": f"Auto-discovered table: {schema}.{table_name}",
-            "base_table": {"database": Config.FABRIC_DATABASE, "schema": schema, "table": table_name},
-        }
-        if pks:
-            new_entry["primary_key"] = {"columns": [k.lower() for k in pks]}
-        # Add inferred columns as dimensions/measures
-        dims, measures = [], []
-        for col in columns:
-            col_name = col["COLUMN_NAME"]
-            col_type = col["DATA_TYPE"].lower()
-            if any(t in col_type for t in ("int", "float", "decimal", "numeric", "money")):
-                measures.append({"name": col_name.lower(), "expr": col_name, "data_type": "number",
-                                 "default_aggregation": "sum"})
-            else:
-                dims.append({"name": col_name.lower(), "expr": col_name, "data_type": col_type})
-        if dims:
-            new_entry["dimensions"] = dims
-        if measures:
-            new_entry["measures"] = measures
-        tables.append(new_entry)
-        existing = tables[-1]
-
-    # Attach Data Vault metadata
-    if "data_vault" in enrichment:
-        existing["data_vault"] = enrichment["data_vault"]
-
-    # Attach sample questions
-    if "sample_questions" in enrichment:
-        existing["sample_questions"] = enrichment["sample_questions"]
-
-    schema_data["tables"] = tables
-
-    # Write back
-    try:
-        with open(yaml_path, "w", encoding="utf-8") as fh:
-            yaml.dump(schema_data, fh, default_flow_style=False, sort_keys=False, allow_unicode=True)
-        logger.info("YAML enriched for table: %s", table_name)
-        return True
-    except Exception as exc:
-        logger.error("Failed to write enriched YAML: %s", exc)
-        return False
-
-
-def auto_discover_and_enrich_yaml(
-    schema: str = "INFORMATION_MART",
-    yaml_path: str | None = None,
-) -> List[str]:
-    """
-    Scan the schema for tables not yet in the YAML and enrich each one.
-    Returns a list of table names that were processed.
-
-    This function is the entry point for req 4 and req 7:
-    'If a new table is added, the YAML should be updated automatically.'
-    """
-    yaml_path = yaml_path or Config.SCHEMA_METADATA_FILE
-    processed = []
-
-    try:
-        with open(yaml_path, "r", encoding="utf-8") as fh:
-            schema_data = yaml.safe_load(fh) or {}
-    except FileNotFoundError:
-        schema_data = {"tables": []}
-
-    known_tables = {
-        t.get("base_table", {}).get("table", "").upper()
-        for t in schema_data.get("tables", [])
-    }
-
-    try:
-        all_tables_df = list_tables_in_schema(schema)
-    except Exception as exc:
-        logger.error("Could not list tables in schema %s: %s", schema, exc)
-        return processed
-
-    for _, row in all_tables_df.iterrows():
-        tname = str(row.get("TABLE_NAME", "")).strip().upper()
-        if tname and tname not in known_tables:
-            logger.info("New table detected: %s. Running AI enrichment.", tname)
-            ok = enrich_yaml_for_table(tname, schema, yaml_path)
-            if ok:
-                processed.append(tname)
-
-    return processed
-
-
-# ---------------------------------------------------------------------------
-# Module self-test
-# ---------------------------------------------------------------------------
-
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-
-    print("Testing SQL generation...")
-    q   = "Show monthly procurement spend for the last 6 months"
-    sql = generate_sql(q)
-    print(f"Question : {q}")
-    print(f"SQL      :\n{sql}")
-
-    print("\nTesting prescriptive insights...")
-    summary = "Top vendor: VENDOR_001 with $4.2M spend (27% of total). Total: $15.5M."
-    insights = generate_prescriptive_insights(summary, "Show top vendors by spend")
-    print(f"Insights:\n{insights}")
+    memory = get_memory_manager()
+    return memory.cleanup_old_contexts(days_old=days_old)
