@@ -36,19 +36,47 @@ from db_service import get_active_session, run_df, execute_query, execute_non_qu
 from llm_service_full import generate_sql, cortex_complete, generate_prescriptive_insights, generate_ai_invoice_suggestion
 import altair as alt
 import urllib.parse
-from db_service import cache_get, cache_set
+from db_service import cache_get as _db_cache_get, cache_set as _db_cache_set
+
+def cache_get(question: str):
+    """
+    Wrapper around db_service.cache_get that deserialises the stored JSON
+    payload back into the dict structure app.py expects:
+      { "sql": <str>, "result_json": <JSON string> }
+    Returns None if there is no cache hit or the payload cannot be parsed.
+    """
+    try:
+        import json as _json
+        raw = _db_cache_get(question)
+        if not raw:
+            return None
+        # db_service may return the raw string or already a dict
+        if isinstance(raw, dict):
+            return raw
+        return _json.loads(raw)
+    except Exception:
+        return None
+
+def cache_set(question: str, sql: str, result_df) -> None:
+    """
+    Wrapper around db_service.cache_set that serialises the DataFrame into
+    the dict structure that cache_get() expects:
+      { "sql": <str>, "result_json": <JSON string> }
+    db_service.cache_set(key, value) takes exactly 2 positional arguments.
+    """
+    try:
+        import json as _json
+        payload = {
+            "sql": sql,
+            "result_json": result_df.to_json(orient="records", date_format="iso")
+            if result_df is not None and not result_df.empty
+            else "[]",
+        }
+        _db_cache_set(question, _json.dumps(payload))
+    except Exception as _ce:
+        logger.warning(f"cache_set wrapper failed: {_ce}")
 from warehouse_setup import ensure_warehouse_tables
-
-# Lazy session getter — never call get_active_session() at module level because
-# Streamlit's SessionInfo is not yet initialized when the module is first imported.
-_session_cache = None
-
-def get_session():
-    """Return (and cache) the active Snowpark/Fabric session, initialised on first use."""
-    global _session_cache
-    if _session_cache is None:
-        _session_cache = get_active_session()
-    return _session_cache
+session = get_active_session()
 
 def _initialize_genie_session():
     """Initialize Genie session state for memory management."""
@@ -193,7 +221,7 @@ _initialize_genie_session()
 if "startup_db_check_done" not in st.session_state:
     st.session_state["startup_db_check_done"] = True
     try:
-        get_session().sql("SELECT 1 AS probe").collect()
+        session.sql("SELECT 1 AS probe").collect()
 
         if "warehouse_setup_done" not in st.session_state:
             try:
@@ -408,7 +436,7 @@ def _resolve_user_identity() -> str:
 
     # ── 2. Fabric SQL CURRENT_USER() ─────────────────────────────────────────
     try:
-        df = get_session().sql("""
+        df = session.sql("""
             SELECT COALESCE(
                 TRIM(CURRENT_USER()),
                 TRIM(SYS_CONTEXT('Fabric$SESSION', 'PRINCIPAL_NAME')),
@@ -772,11 +800,10 @@ def sql_date(d: date) -> str:
 
 def run_df(sql: str) -> pd.DataFrame:
     try:
-        _sess = get_session()
-        if not _sess:
+        if not session:
             st.error("Database session is not active. Please check the connection.")
             return pd.DataFrame()
-        return _sess.sql(sql).to_pandas()
+        return session.sql(sql).to_pandas()
     except Exception as e:
         st.warning(f"Query failed: {e}\nSQL: {sql}")
         return pd.DataFrame()
@@ -4734,7 +4761,6 @@ if st.session_state.get('page') == 'genie':
         
         #CACHE THE RESULT - Save to QUERY_RESULT_CACHE warehouse table
         try:
-            from db_service import cache_set
             if isinstance(response, dict) and 'message' in response:
                 # Extract SQL from response structure
                 result_sql = ''
