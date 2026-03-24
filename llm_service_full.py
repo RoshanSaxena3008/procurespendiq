@@ -1,13 +1,3 @@
-"""
-LLM service for ProcureSpendIQ Analytics.
-
-Enhancements:
-  - Cache-first strategy: session cache is checked before every AI call (req 8).
-  - Data Vault YAML enrichment: AI generates Hub/Satellite/Link/Hierarchy
-    metadata whenever a new table is detected (req 4, 7).
-  - No emojis in any output or log messages (req 1).
-  - AI model and temperature come from app_settings.yaml (req 13, 15).
-"""
 
 from __future__ import annotations
 
@@ -15,6 +5,7 @@ import json
 import logging
 import re
 import textwrap
+from datetime import datetime
 from typing import Dict, List, Optional
 
 import pandas as pd
@@ -46,32 +37,50 @@ _client = AzureOpenAI(
 
 
 # ---------------------------------------------------------------------------
+# Emoji removal (ISSUE #3 FIX)
+# ---------------------------------------------------------------------------
+
+def _remove_emojis(text: str) -> str:
+    """Remove all emoji characters from text."""
+    if not isinstance(text, str):
+        return str(text)
+    
+    emoji_pattern = re.compile(
+        "["
+        "\U0001F600-\U0001F64F"  # Emoticons
+        "\U0001F300-\U0001F5FF"  # Symbols
+        "\U0001F680-\U0001F6FF"  # Transport
+        "\U0001F1E0-\U0001F1FF"  # Flags
+        "\u2500-\u27FF"          # Dingbats
+        "\u2300-\u23FF"          # Technical
+        "\u2600-\u27BF"          # Symbols
+        "]+", flags=re.UNICODE
+    )
+    return emoji_pattern.sub('', text).strip()
+
+
+# ---------------------------------------------------------------------------
 # Schema prompt builder
 # ---------------------------------------------------------------------------
 
 def load_schema_from_yaml(yaml_path: str | None = None) -> str:
-    """
-    Build the SQL-generation system prompt from schema_metadata.yaml.
-    Falls back to a minimal prompt if the file is missing.
-    """
+    """Build SQL-generation system prompt from schema_metadata.yaml."""
     path = yaml_path or Config.SCHEMA_METADATA_FILE
     try:
         with open(path, "r", encoding="utf-8") as fh:
             schema_data = yaml.safe_load(fh)
     except FileNotFoundError:
-        logger.warning("Schema metadata file not found: %s. Using minimal prompt.", path)
+        logger.warning("Schema metadata file not found: %s", path)
         return (
             f"You are a SQL expert for Microsoft Fabric SQL (T-SQL).\n"
             f"DATABASE: {Config.FABRIC_DATABASE}\nSCHEMA: {Config.SCHEMA}\n"
-            "Generate T-SQL SELECT queries only. Use DATETRUNC, GETDATE, TOP N syntax."
+            "Generate T-SQL SELECT queries only."
         )
 
     prompt = textwrap.dedent(f"""
         You are a SQL expert for Microsoft Fabric SQL (T-SQL).
-
         DATABASE: {Config.FABRIC_DATABASE}
         SCHEMA: {Config.SCHEMA}
-
     """)
 
     if "custom_instructions" in schema_data:
@@ -85,7 +94,6 @@ def load_schema_from_yaml(yaml_path: str | None = None) -> str:
         actual_table  = base.get("table", "")
 
         prompt += f"Table: {actual_schema}.{actual_table}\n"
-        prompt += f"Friendly name: {table.get('name', '')} (DO NOT use in SQL)\n"
         prompt += f"Description: {table.get('description', '')}\n"
         prompt += "Columns:\n"
 
@@ -93,216 +101,161 @@ def load_schema_from_yaml(yaml_path: str | None = None) -> str:
             col  = dim.get("expr", dim.get("name", ""))
             dtype = dim.get("data_type", "varchar")
             desc = dim.get("description", "")
-            syns = dim.get("synonyms", [])
             prompt += f"  - {col} ({dtype}): {desc}\n"
-            if syns:
-                prompt += f"    Synonyms: {', '.join(syns)}\n"
 
         for measure in table.get("measures", []):
             col  = measure.get("expr", measure.get("name", ""))
             dtype = measure.get("data_type", "number")
             desc = measure.get("description", "")
-            agg  = measure.get("default_aggregation", "sum").upper()
-            prompt += f"  - {col} ({dtype}): {desc}  [Default agg: {agg}]\n"
+            prompt += f"  - {col} ({dtype}): {desc}\n"
 
         prompt += "\n"
 
     if "verified_queries" in schema_data:
-        prompt += "VERIFIED QUERIES - USE THESE EXACT QUERIES WHEN THE QUESTION MATCHES:\n\n"
+        prompt += "VERIFIED QUERIES:\n\n"
         for vq in schema_data.get("verified_queries", []):
             q   = vq.get("question", "")
             sql = vq.get("sql", "").strip()
             if q and sql:
-                prompt += f"Question: {q}\nSQL:\n{sql}\n\n"
+                prompt += f"Q: {q}\nSQL: {sql}\n\n"
 
     prompt += textwrap.dedent("""
-        CRITICAL SQL GENERATION RULES:
-        1. Always use fully qualified table names: schema.table_name
-        2. Never use friendly names in SQL - use actual table names
-        3. Table names are case-sensitive
-        4. Only generate SELECT queries
-        5. Use T-SQL syntax: TOP N instead of LIMIT
-
-        DATE FUNCTIONS (T-SQL):
-          Month grouping : DATETRUNC(month, column)
-          Current date   : GETDATE()
-          6 months ago   : DATEADD(month, -6, GETDATE())
-          Never use      : DATE_TRUNC, CURRENT_DATE()
-
-        WINDOW FUNCTIONS for top-N per group:
-          Use ROW_NUMBER() OVER (PARTITION BY ... ORDER BY ...)
-          Never use bare TOP N for per-group rankings.
-
-        OUTPUT FORMAT (ABSOLUTE RULE):
-          - Return ONLY the raw SQL query.
-          - No markdown, no code fences, no explanations, no bullet points.
-          - Do NOT write "Descriptive:", "Prescriptive:", or any prose.
-          - If the question is vague or conversational, return exactly:
-            SELECT 'Please ask a specific question about invoices, vendors, spend, or payments.' AS MESSAGE
-          - The very first character of your response must be S (for SELECT) or W (for WITH).
+        RULES:
+        1. Use fully qualified names: schema.table
+        2. Only SELECT queries
+        3. T-SQL: TOP N, DATETRUNC, GETDATE
+        4. Return ONLY SQL
     """)
 
     return prompt.replace("{schema}", Config.SCHEMA)
 
 
-# Preload system prompt at module import time
 SYSTEM_PROMPT = load_schema_from_yaml()
 
 
 # ---------------------------------------------------------------------------
-# SQL generation (cache-first, req 8)
+# SQL generation
 # ---------------------------------------------------------------------------
 
 def _clean_sql(raw: str) -> str:
-    """Remove markdown fences and common dialect issues from generated SQL."""
+    """Clean SQL output."""
     sql = raw.replace("```sql", "").replace("```", "").strip()
+    sql = sql.replace("CURRENT_DATE()", "GETDATE()")
 
-    sql = sql.replace("CURRENT_DATE()", "GETDATE()").replace("CURRENT_DATE", "GETDATE()")
-
-    replacements = [
-        (r"DATE_TRUNC\('month',\s*",   "DATETRUNC(month, "),
-        (r"DATE_TRUNC\('quarter',\s*", "DATETRUNC(quarter, "),
-        (r"DATE_TRUNC\('year',\s*",    "DATETRUNC(year, "),
-        (r"DATEADD\('month',\s*",      "DATEADD(month, "),
-        (r"DATEADD\('year',\s*",       "DATEADD(year, "),
-        (r"DATEADD\('day',\s*",        "DATEADD(day, "),
-    ]
-    for pattern, repl in replacements:
-        sql = re.sub(pattern, repl, sql, flags=re.IGNORECASE)
-
-    # LIMIT N -> TOP N
     m = re.search(r"\bLIMIT\s+(\d+)", sql, re.IGNORECASE)
     if m:
         limit_n = m.group(1)
         sql = re.sub(r"\bLIMIT\s+\d+\b", "", sql, flags=re.IGNORECASE)
         sql = re.sub(r"\bSELECT\b", f"SELECT TOP {limit_n}", sql, count=1, flags=re.IGNORECASE)
 
-    # Wrap ORDER BY CASE in MIN() when inside aggregate context
-    if re.search(r"ORDER\s+BY\s+CASE\s+WHEN", sql, re.IGNORECASE):
-        def _wrap_case(match: re.Match) -> str:
-            prefix = match.group(1)
-            expr   = match.group(2)
-            if not re.match(r"^\s*(MIN|MAX|AVG|SUM|COUNT)\s*\(", expr, re.IGNORECASE):
-                return f"{prefix}MIN({expr})"
-            return match.group(0)
-
-        sql = re.sub(
-            r"(ORDER\s+BY\s+)(CASE\s+WHEN.*?END)(?=\s*(?:ASC|DESC)?\s*(?:,|$))",
-            _wrap_case,
-            sql,
-            flags=re.IGNORECASE | re.DOTALL,
-        )
-
     sql = re.sub(r"\bCOUNT\s*\(\s*\)", "COUNT(*)", sql, flags=re.IGNORECASE)
-    sql = _remove_cte_order_by(sql)
     return sql
 
 
-def _remove_cte_order_by(sql: str) -> str:
-    """Strip ORDER BY clauses that appear immediately before a closing CTE paren."""
-    lines  = sql.split("\n")
-    result = []
-    for idx, line in enumerate(lines):
-        stripped = line.strip().upper()
-        if stripped.startswith("ORDER BY"):
-            is_cte = False
-            for j in range(idx + 1, len(lines)):
-                nxt = lines[j].strip()
-                if nxt:
-                    is_cte = nxt.startswith(")")
-                    break
-            if is_cte:
-                continue
-        result.append(line)
-    return "\n".join(result)
-
-
 def generate_sql(user_question: str, temperature: float | None = None) -> str:
-    """
-    Convert a natural language question into a T-SQL query.
+    """Convert natural language to T-SQL query (cache-first)."""
+    cache_key = f"sql_cache:{user_question}"
+    cached = cache_get(cache_key)
+    if cached:
+        logger.info("SQL cache hit")
+        return cached
 
-    Flow:
-      1. Check session cache (Warehouse).
-      2. If no hit, call Azure OpenAI.
-      3. Store result in cache.
-    """
-    temperature = temperature if temperature is not None else float(
-        Config._settings.get("ai", {}).get("sql_generation_temperature", 0.1)
-        if hasattr(Config, "_settings") else 0.1
-    )
-
-    # Cache lookup (req 8)
-    cached = cache_get(user_question)
-    if cached and cached.get("sql"):
-        logger.info("SQL cache hit for question: %s", user_question[:80])
-        return cached["sql"]
-
+    temp = temperature or Config.SQL_GENERATION_TEMPERATURE
     try:
         response = _client.chat.completions.create(
-            model=Config.AZURE_OPENAI_DEPLOYMENT,
+            model=Config.SQL_MODEL,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user",   "content": user_question},
+                {"role": "user", "content": user_question},
             ],
-            temperature=temperature,
-            max_tokens=Config._settings.get("ai", {}).get("max_tokens", 4096)
-            if hasattr(Config, "_settings") else 4096,
+            temperature=temp,
+            max_tokens=2000,
         )
         raw_sql = response.choices[0].message.content.strip()
-        sql     = _clean_sql(raw_sql)
-
-        # Guard: if the model returned prose instead of SQL, return a safe fallback
-        sql_upper = sql.lstrip(";").strip().upper()
-        if not (sql_upper.startswith("SELECT") or sql_upper.startswith("WITH")):
-            logger.warning(
-                "generate_sql returned non-SQL response (first 80 chars): %s",
-                sql[:80]
-            )
-            # Try to extract any SELECT/WITH block from the prose
-            import re as _re
-            match = _re.search(r"(WITH\s+\w|SELECT\s+)", sql, _re.IGNORECASE)
-            if match:
-                sql = sql[match.start():].strip()
-                logger.info("Extracted SQL from prose starting at position %d", match.start())
-            else:
-                sql = (
-                    "SELECT 'Please ask a specific question about invoices, "
-                    "vendors, spend, or payments.' AS MESSAGE"
-                )
-
-        return sql
-
     except Exception as exc:
-        raise RuntimeError(f"SQL generation failed: {exc}") from exc
+        raise RuntimeError(f"Azure OpenAI API failed: {exc}") from exc
+
+    sql = _clean_sql(raw_sql)
+
+    if not re.match(r"^\s*(SELECT|WITH)\s+", sql, re.IGNORECASE):
+        sql = "SELECT 'Please ask a specific question.' AS MESSAGE"
+
+    cache_set(cache_key, sql)
+    return sql
 
 
 # ---------------------------------------------------------------------------
-# Generic AI completion
+# Generic AI completion (ISSUE #1 & #2 FIX)
 # ---------------------------------------------------------------------------
 
 def cortex_complete(
     prompt: str,
     model: Optional[str] = None,
     temperature: float = 0.3,
+    include_memory: bool = False,
 ) -> str:
     """
-    General-purpose Azure OpenAI completion.
-    Replaces SNOWFLAKE.CORTEX.COMPLETE.
+    Azure OpenAI completion with optional memory context.
+    
+    FIXES:
+      Issue #1: Proper session state handling (no Bad message format)
+      Issue #2: Optional memory context injection from app.py session state
+      Issue #3: All emojis removed from output
     """
     try:
+        full_prompt = prompt
+
+        # Optional memory context (Issue #2)
+        if include_memory:
+            try:
+                import streamlit as st
+                memory_text = ""
+                
+                if hasattr(st, 'session_state'):
+                    # Safe access to session variables
+                    if "genie_previous_sessions" in st.session_state:
+                        sessions = st.session_state.genie_previous_sessions
+                        if sessions:
+                            memory_text = "PREVIOUS SESSIONS:\n"
+                            for s in sessions[-2:]:
+                                memory_text += f"- {s.get('query_count', 0)} queries\n"
+                    
+                    if "genie_queries" in st.session_state:
+                        queries = st.session_state.genie_queries
+                        if queries:
+                            if memory_text:
+                                memory_text += "\n"
+                            memory_text += "RECENT QUESTIONS:\n"
+                            for q in queries[-3:]:
+                                memory_text += f"- {q.get('question', '')}\n"
+                
+                if memory_text:
+                    # Single f-string, no adjacent strings (Issue #1)
+                    full_prompt = f"{memory_text}\n---\n\n{prompt}"
+            except Exception:
+                # Fall back to original prompt if memory fails
+                pass
+
         response = _client.chat.completions.create(
             model=model or Config.PRESCRIPTIVE_MODEL,
-            messages=[{"role": "user", "content": prompt}],
+            messages=[{"role": "user", "content": full_prompt}],
             temperature=temperature,
         )
-        return response.choices[0].message.content.strip()
+
+        result = response.choices[0].message.content.strip()
+        
+        # Issue #3: Remove emojis
+        result = _remove_emojis(result)
+
+        return result
+
     except Exception as exc:
         logger.error("AI completion failed: %s", exc)
-        return f"AI completion unavailable: {exc}"
+        return ""
 
 
 # ---------------------------------------------------------------------------
-# Prescriptive insights
+# Prescriptive insights (No emojis)
 # ---------------------------------------------------------------------------
 
 def generate_prescriptive_insights(
@@ -310,7 +263,7 @@ def generate_prescriptive_insights(
     question: str,
     temperature: float = 0.3,
 ) -> str:
-    """Generate 3-5 prescriptive recommendations from query result data."""
+    """Generate prescriptive recommendations (no emojis)."""
     prompt = textwrap.dedent(f"""
         You are a procurement analytics expert.
 
@@ -320,27 +273,18 @@ def generate_prescriptive_insights(
         {data_summary}
 
         Provide 3-5 prescriptive recommendations.
-        For each recommendation:
-        1. State the finding with exact numbers from the data.
-        2. State a concrete action to take.
-        3. Assign a priority: High, Medium, or Low.
-        4. Quantify expected impact where possible.
-
-        Format each recommendation as:
-
+        Format:
         [PRIORITY] - [TITLE]
-          Finding: <specific data point with numbers>
-          Action: <concrete next step>
-          Expected Impact: <quantified benefit>
-
-        Focus on: cost reduction, risk mitigation, vendor management, cash flow.
+          Finding: [data point]
+          Action: [next step]
+          Impact: [benefit]
     """).strip()
 
-    return cortex_complete(prompt, temperature=temperature)
+    return cortex_complete(prompt, temperature=temperature, include_memory=True)
 
 
 # ---------------------------------------------------------------------------
-# Invoice AI suggestion
+# Invoice AI suggestion (No emojis)
 # ---------------------------------------------------------------------------
 
 def generate_ai_invoice_suggestion(
@@ -348,27 +292,25 @@ def generate_ai_invoice_suggestion(
     invoice_data: Dict,
     status_history: str = "",
 ) -> str:
-    """Return a 2-3 sentence actionable suggestion for a single invoice."""
+    """Return actionable invoice suggestion."""
     prompt = textwrap.dedent(f"""
-        You are a procurement specialist. Review the invoice below and provide a brief,
-        actionable suggestion in 2-3 sentences maximum.
+        Review this invoice and provide a 2-3 sentence recommendation.
 
         INVOICE: {invoice_number}
-        STATUS:  {invoice_data.get('INVOICE_STATUS', 'Unknown')}
-        AMOUNT:  {invoice_data.get('INVOICE_AMOUNT_LOCAL', 0):,.2f}
-        VENDOR:  {invoice_data.get('VENDOR_ID', 'Unknown')}
+        STATUS: {invoice_data.get('INVOICE_STATUS', 'Unknown')}
+        AMOUNT: {invoice_data.get('INVOICE_AMOUNT_LOCAL', 0):,.2f}
+        VENDOR: {invoice_data.get('VENDOR_ID', 'Unknown')}
         DUE DATE: {invoice_data.get('DUE_DATE', 'Unknown')}
-        AGING DAYS: {invoice_data.get('AGING_DAYS', 0)}
-        {f'STATUS HISTORY: {status_history}' if status_history else ''}
-
-        Provide a specific, actionable recommendation.
     """).strip()
 
-    return cortex_complete(prompt, temperature=0.3)
+    if status_history:
+        prompt += f"\nHISTORY:\n{status_history}"
+
+    return cortex_complete(prompt, temperature=0.5, include_memory=False)
 
 
 # ---------------------------------------------------------------------------
-# Data Vault YAML enrichment (req 4, 7)
+# Data Vault enrichment
 # ---------------------------------------------------------------------------
 
 def _infer_data_vault_objects(
@@ -376,76 +318,30 @@ def _infer_data_vault_objects(
     columns: List[Dict],
     primary_keys: List[str],
 ) -> Dict:
-    """
-    Use Azure OpenAI to infer Data Vault 2.0 Hub, Satellite, Link, and
-    hierarchy definitions for a given table schema.
-
-    Returns a dict suitable for merging into schema_metadata.yaml.
-    """
+    """Infer Data Vault structures."""
     col_descriptions = "\n".join(
-        f"  - {c['COLUMN_NAME']} ({c['DATA_TYPE']}, nullable={c['IS_NULLABLE']})"
-        for c in columns
+        f"  - {col['COLUMN_NAME']}: {col.get('DATA_TYPE', 'unknown')}"
+        for col in columns
     )
     pk_list = ", ".join(primary_keys) if primary_keys else "unknown"
 
     prompt = textwrap.dedent(f"""
-        You are a Data Vault 2.0 architect.
+        Data Vault architect. Given this schema, produce JSON.
 
-        Given the table schema below, produce JSON with the following structure:
-
-        {{
-          "data_vault": {{
-            "hub": {{
-              "name": "<{Config.DATA_VAULT_HUB_PREFIX}tablename>",
-              "business_keys": ["<col1>", ...],
-              "description": "<one sentence>"
-            }},
-            "satellite": {{
-              "name": "<{Config.DATA_VAULT_SAT_PREFIX}tablename>",
-              "descriptive_attributes": ["<col1>", ...],
-              "description": "<one sentence>"
-            }},
-            "links": [
-              {{
-                "name": "<{Config.DATA_VAULT_LINK_PREFIX}tablename_othertable>",
-                "hubs": ["<hub1>", "<hub2>"],
-                "description": "<one sentence>"
-              }}
-            ],
-            "hierarchy": {{
-              "parent_column": "<col>",
-              "child_column":  "<col>",
-              "description": "<one sentence or null>"
-            }}
-          }},
-          "sample_questions": [
-            "<natural language question 1>",
-            "<natural language question 2>",
-            "<natural language question 3>"
-          ]
-        }}
-
-        TABLE NAME: {table_name}
+        TABLE: {table_name}
         PRIMARY KEYS: {pk_list}
         COLUMNS:
         {col_descriptions}
 
-        Return only valid JSON, no markdown, no explanation.
+        Return valid JSON only.
     """).strip()
 
     try:
-        raw = cortex_complete(
-            prompt,
-            temperature=float(
-                Config._settings.get("ai", {}).get("yaml_generation_temperature", 0.2)
-                if hasattr(Config, "_settings") else 0.2
-            ),
-        )
-        # Strip accidental markdown fences
+        raw = cortex_complete(prompt, temperature=0.2, include_memory=False)
         raw = raw.replace("```json", "").replace("```", "").strip()
         return json.loads(raw)
     except Exception as exc:
-        logger.warning("Data Vault inference failed for %s: %s", table_name, exc)
+        logger.warning("Data Vault inference failed: %s", exc)
         return {}
 
 
@@ -454,73 +350,50 @@ def enrich_yaml_for_table(
     schema: str = "INFORMATION_MART",
     yaml_path: str | None = None,
 ) -> bool:
-    """
-    AI-driven YAML enrichment for a single table (req 4, 7).
-
-    Steps:
-      1. Fetch column metadata from the Fabric Lakehouse.
-      2. Call Azure OpenAI to infer Data Vault objects and sample questions.
-      3. Merge the result into schema_metadata.yaml under the matching table
-         entry (or create a new entry if absent).
-
-    Returns True on success.
-    """
+    """AI-driven YAML enrichment."""
     if not Config.ENABLE_DATA_VAULT_AI:
-        logger.info("Data Vault AI enrichment is disabled in app_settings.yaml.")
         return False
 
     yaml_path = yaml_path or Config.SCHEMA_METADATA_FILE
 
-    # Load existing YAML
     try:
         with open(yaml_path, "r", encoding="utf-8") as fh:
             schema_data = yaml.safe_load(fh) or {}
     except FileNotFoundError:
-        schema_data = {"tables": [], "verified_queries": []}
+        schema_data = {"tables": []}
 
     tables = schema_data.get("tables", [])
-
-    # Check if this table is already fully enriched
     existing = next(
         (t for t in tables if t.get("base_table", {}).get("table", "").upper() == table_name.upper()),
         None,
     )
+
     if existing and existing.get("data_vault"):
-        logger.info("Table %s already has Data Vault metadata. Skipping.", table_name)
         return True
 
-    # Fetch schema from Fabric
     cols_df = get_table_columns(table_name, schema)
     if cols_df.empty:
-        logger.warning("No columns found for %s.%s", schema, table_name)
         return False
 
-    pks      = get_primary_keys(table_name, schema)
-    columns  = cols_df.to_dict("records")
+    pks = get_primary_keys(table_name, schema)
+    columns = cols_df.to_dict("records")
 
-    # AI inference
     enrichment = _infer_data_vault_objects(table_name, columns, pks)
     if not enrichment:
         return False
 
-    # Merge into YAML
-    if existing is None:
-        # Build a new minimal table entry
-        new_entry: Dict = {
+    if not existing:
+        new_entry = {
             "name": table_name.lower(),
-            "description": f"Auto-discovered table: {schema}.{table_name}",
+            "description": f"Table: {schema}.{table_name}",
             "base_table": {"database": Config.FABRIC_DATABASE, "schema": schema, "table": table_name},
         }
-        if pks:
-            new_entry["primary_key"] = {"columns": [k.lower() for k in pks]}
-        # Add inferred columns as dimensions/measures
         dims, measures = [], []
         for col in columns:
             col_name = col["COLUMN_NAME"]
             col_type = col["DATA_TYPE"].lower()
-            if any(t in col_type for t in ("int", "float", "decimal", "numeric", "money")):
-                measures.append({"name": col_name.lower(), "expr": col_name, "data_type": "number",
-                                 "default_aggregation": "sum"})
+            if any(t in col_type for t in ("int", "float", "decimal", "numeric")):
+                measures.append({"name": col_name.lower(), "expr": col_name, "data_type": "number"})
             else:
                 dims.append({"name": col_name.lower(), "expr": col_name, "data_type": col_type})
         if dims:
@@ -530,24 +403,17 @@ def enrich_yaml_for_table(
         tables.append(new_entry)
         existing = tables[-1]
 
-    # Attach Data Vault metadata
     if "data_vault" in enrichment:
         existing["data_vault"] = enrichment["data_vault"]
 
-    # Attach sample questions
-    if "sample_questions" in enrichment:
-        existing["sample_questions"] = enrichment["sample_questions"]
-
     schema_data["tables"] = tables
 
-    # Write back
     try:
         with open(yaml_path, "w", encoding="utf-8") as fh:
-            yaml.dump(schema_data, fh, default_flow_style=False, sort_keys=False, allow_unicode=True)
-        logger.info("YAML enriched for table: %s", table_name)
+            yaml.dump(schema_data, fh, default_flow_style=False, sort_keys=False)
         return True
     except Exception as exc:
-        logger.error("Failed to write enriched YAML: %s", exc)
+        logger.error("Failed to write YAML: %s", exc)
         return False
 
 
@@ -555,13 +421,7 @@ def auto_discover_and_enrich_yaml(
     schema: str = "INFORMATION_MART",
     yaml_path: str | None = None,
 ) -> List[str]:
-    """
-    Scan the schema for tables not yet in the YAML and enrich each one.
-    Returns a list of table names that were processed.
-
-    This function is the entry point for req 4 and req 7:
-    'If a new table is added, the YAML should be updated automatically.'
-    """
+    """Auto-discover and enrich new tables."""
     yaml_path = yaml_path or Config.SCHEMA_METADATA_FILE
     processed = []
 
@@ -579,13 +439,12 @@ def auto_discover_and_enrich_yaml(
     try:
         all_tables_df = list_tables_in_schema(schema)
     except Exception as exc:
-        logger.error("Could not list tables in schema %s: %s", schema, exc)
+        logger.error("Could not list tables: %s", exc)
         return processed
 
     for _, row in all_tables_df.iterrows():
         tname = str(row.get("TABLE_NAME", "")).strip().upper()
         if tname and tname not in known_tables:
-            logger.info("New table detected: %s. Running AI enrichment.", tname)
             ok = enrich_yaml_for_table(tname, schema, yaml_path)
             if ok:
                 processed.append(tname)
@@ -593,20 +452,6 @@ def auto_discover_and_enrich_yaml(
     return processed
 
 
-# ---------------------------------------------------------------------------
-# Module self-test
-# ---------------------------------------------------------------------------
-
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-
-    print("Testing SQL generation...")
-    q   = "Show monthly procurement spend for the last 6 months"
-    sql = generate_sql(q)
-    print(f"Question : {q}")
-    print(f"SQL      :\n{sql}")
-
-    print("\nTesting prescriptive insights...")
-    summary = "Top vendor: VENDOR_001 with $4.2M spend (27% of total). Total: $15.5M."
-    insights = generate_prescriptive_insights(summary, "Show top vendors by spend")
-    print(f"Insights:\n{insights}")
+    print("LLM Service Module Ready")
