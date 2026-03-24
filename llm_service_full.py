@@ -203,6 +203,11 @@ def cortex_complete(
       Issue #3: All emojis removed from output
     """
     try:
+        # Ensure prompt is always a non-empty string — Azure OpenAI rejects None or ""
+        if not isinstance(prompt, str) or not prompt.strip():
+            logger.warning("cortex_complete called with empty/invalid prompt")
+            return ""
+
         full_prompt = prompt
 
         # Optional memory context (Issue #2)
@@ -238,7 +243,7 @@ def cortex_complete(
 
         response = _client.chat.completions.create(
             model=model or Config.PRESCRIPTIVE_MODEL,
-            messages=[{"role": "user", "content": full_prompt}],
+            messages=[{"role": "user", "content": full_prompt or prompt}],
             temperature=temperature,
         )
 
