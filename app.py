@@ -17,6 +17,8 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 from datetime import date, timedelta
+from datetime import date, timedelta, datetime  
+import uuid
 from typing import Optional
 
 # Initialize logger
@@ -38,6 +40,119 @@ from db_service import cache_get, cache_set
 from warehouse_setup import ensure_warehouse_tables
 session = get_active_session()
 
+def _initialize_genie_session():
+    """Initialize Genie session state for memory management."""
+    if "genie_session_initialized" not in st.session_state:
+        st.session_state.genie_session_initialized = True
+        st.session_state.genie_session_id = f"genie_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{str(uuid.uuid4())[:8]}"
+        st.session_state.genie_queries = []
+        st.session_state.genie_previous_sessions = []
+        logger.info(f"Genie session initialized: {st.session_state.genie_session_id}")
+
+
+def save_query_to_session_memory(question: str, sql: str, result_summary: str):
+    """Save query to current session memory (short-term)."""
+    _initialize_genie_session()
+    st.session_state.genie_queries.append({
+        "question": question,
+        "sql": sql,
+        "summary": result_summary,
+        "timestamp": datetime.now().isoformat()
+    })
+    if len(st.session_state.genie_queries) > 5:
+        st.session_state.genie_queries = st.session_state.genie_queries[-5:]
+    logger.info(f"Query saved to session memory: {question[:50]}")
+
+
+def archive_session_to_longterm_memory(session_summary: str = ""):
+    """Move current session to long-term memory."""
+    if not st.session_state.genie_queries:
+        return
+    session_obj = {
+        "session_id": st.session_state.genie_session_id,
+        "query_count": len(st.session_state.genie_queries),
+        "queries": [q["question"] for q in st.session_state.genie_queries],
+        "timestamp": datetime.now().isoformat(),
+        "summary": session_summary,
+        "key_topics": _extract_key_topics(st.session_state.genie_queries)
+    }
+    st.session_state.genie_previous_sessions.append(session_obj)
+    if len(st.session_state.genie_previous_sessions) > 2:
+        st.session_state.genie_previous_sessions = st.session_state.genie_previous_sessions[-2:]
+    logger.info(f"Session {st.session_state.genie_session_id} archived to long-term memory")
+
+
+def get_session_context_for_prompt() -> str:
+    """Build memory context string to inject into LLM prompts."""
+    _initialize_genie_session()
+    context = ""
+    if st.session_state.genie_previous_sessions:
+        context += "CONTEXT FROM YOUR PREVIOUS SESSIONS:\n"
+        for i, session in enumerate(st.session_state.genie_previous_sessions[-2:], 1):
+            context += f"\nSession {i}:\n"
+            context += f"  Queries: {session.get('query_count', 0)}\n"
+            topics = session.get('key_topics', [])
+            if topics:
+                context += f"  Topics: {', '.join(topics[:3])}\n"
+            queries = session.get('queries', [])
+            if queries:
+                context += f"  Key questions: {', '.join(queries[:2])}\n"
+        context += "\n---\n\n"
+    if st.session_state.genie_queries:
+        context += "YOUR RECENT QUESTIONS IN THIS SESSION:\n"
+        for q in st.session_state.genie_queries[-3:]:
+            context += f"- {q['question']}\n"
+        context += "\n---\n\n"
+    return context
+
+
+def _extract_key_topics(queries: list) -> list:
+    """Extract key topics from list of queries."""
+    topics = set()
+    keywords = {
+        "vendor": "Vendor Analysis",
+        "spend": "Spend Management",
+        "invoice": "Invoice Processing",
+        "payment": "Payment Analysis",
+        "po": "Purchase Orders",
+        "cost": "Cost Analysis",
+        "risk": "Risk Management",
+        "compliance": "Compliance",
+        "budget": "Budget Tracking",
+        "forecast": "Forecasting"
+    }
+    for q in queries:
+        question_lower = q.get("question", "").lower()
+        for keyword, topic in keywords.items():
+            if keyword in question_lower:
+                topics.add(topic)
+    return list(topics)[:3]
+
+
+def display_session_history_sidebar():
+    """Display last 2 sessions in Streamlit sidebar."""
+    _initialize_genie_session()
+    with st.sidebar:
+        st.markdown("---")
+        st.subheader("Session History")
+        if st.session_state.genie_previous_sessions:
+            for i, session in enumerate(st.session_state.genie_previous_sessions[-2:], 1):
+                session_id_short = session.get('session_id', 'Unknown')[:25]
+                with st.expander(f"Session {i}: {session_id_short}..."):
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.metric("Queries", session.get('query_count', 0))
+                    with col2:
+                        topics = session.get('key_topics', [])
+                        st.write(f"**Topics:** {', '.join(topics) if topics else 'General'}")
+                    st.write("**Questions Asked:**")
+                    for q in session.get('queries', [])[:3]:
+                        st.write(f"- {q}")
+                    if len(session.get('queries', [])) > 3:
+                        st.text(f"... and {len(session['queries']) - 3} more")
+        else:
+            st.info("No previous sessions")
+
 # ---------- Dependencies Check ----------
 try:
     import streamlit as st
@@ -58,13 +173,13 @@ st.set_page_config(
     layout="wide",
     page_icon=PAGE_ICON_URL,
 )
-
+display_session_history_sidebar()
 # ---------- Fabric Session ----------
 # Session object is created immediately (no network call — just builds the object).
 # All DB work is deferred until after Streamlit binds its port, so Azure's 230s
 # container warmup probe succeeds before any slow DB connection can time it out.
 session = get_active_session()
-
+_initialize_genie_session()
 if "startup_db_check_done" not in st.session_state:
     st.session_state["startup_db_check_done"] = True
     try:
@@ -774,7 +889,12 @@ def _get_ai_invoice_suggestion(invoice_number: str, inv_row: dict, status_histor
 
 
 def _cortex_complete_prescriptive(content: list, run_df_func, question: str) -> str:
-    """Generate prescriptive insights using Azure OpenAI (replacing CORTEX.COMPLETE)."""
+    """Generate prescriptive insights using Azure OpenAI."""
+    
+    # CRITICAL FIX: Ensure session is initialized before proceeding
+    if "genie_session_initialized" not in st.session_state:
+        _initialize_genie_session()
+    
     data_parts = []
     for block in content or []:
         if block.get("type") != "sql":
@@ -786,38 +906,43 @@ def _cortex_complete_prescriptive(content: list, run_df_func, question: str) -> 
             df = run_df_func(sql)
             if df is None or df.empty:
                 continue
-            # Limit rows to stay within token budget
             head = df.head(40)
             data_parts.append(head.to_string(index=False, max_colwidth=40))
-        except Exception:
+        except Exception as e:
+            logger.warning(f"Failed to execute SQL block: {e}")
             continue
     
     if not data_parts:
         return ""
     
     data_str = "\n\n---\n\n".join(data_parts)
-    if len(data_str) > 15000:  # Trim if too long
-        data_str = data_str[:15000] + "\n... (truncated)"
+    if len(data_str) > 15000:
+        data_str = data_str[:15000] + "\n(truncated)"
     
+    # FIX: Single f-string with explicit newlines (no adjacent f-strings)
     prompt = (
-        "You are a procurement business analyst. The user asked a question and received the following data from our analytics. "
+        "You are a procurement business analyst. The user asked a question "
+        "and received the following data from our analytics. "
         "Provide prescriptive insights: specific recommended actions and risks based on the data. "
         "Be concrete: cite numbers, vendor names, amounts, and percentages from the data. "
-        "Format as numbered list with each item on a NEW LINE (1. ...\n2. ...\n3. ...). Bold ALL key numbers using ** e.g. **$30.98M**, **94%**. Do NOT use HTML tags like <strong>. Each numbered point must start on its own line.\n\n"
+        "Format as numbered list with each item on a NEW LINE (1. ...\n2. ...\n3. ...). "
+        "Bold ALL key numbers using ** e.g. **30.98M**, **94%**. "
+        "Do NOT use HTML tags like <strong>. "
+        "Each numbered point must start on its own line.\n\n"
         f"User question: {question}\n\n"
         f"Data:\n{data_str}"
     )
     
     try:
-        #  Use cortex_complete with full formatted prompt
-        result = cortex_complete(prompt, temperature=0.3)
+        # ISSUE #2 FIX: Include memory context
+        result = cortex_complete(prompt, temperature=0.3, include_memory=True)
         if result and len(result.strip()) > 20:
+            save_query_to_session_memory(question, "SELECT (insight)", result[:200])
             return result.strip()
     except Exception as e:
-        print(f"Prescriptive insights failed: {e}")
+        logger.error(f"Prescriptive insights failed: {e}")
     
     return ""
-
 
 def _generate_prescriptive_from_data(content: list, run_df_func) -> str:
     """Generate data-driven prescriptive insights from SQL result dataframes when Cortex returns generic text."""
@@ -4596,7 +4721,7 @@ if st.session_state.get('page') == 'genie':
         # Persist question for all-sessions recent & FAQ (not session-specific)
         _append_genie_question(query, analysis_type)
         
-        # ✅ CACHE THE RESULT - Save to QUERY_RESULT_CACHE warehouse table
+        #CACHE THE RESULT - Save to QUERY_RESULT_CACHE warehouse table
         try:
             from db_service import cache_set
             if isinstance(response, dict) and 'message' in response:
