@@ -188,6 +188,7 @@ display_session_history_sidebar()
 # Session object is created immediately (no network call — just builds the object).
 # All DB work is deferred until after Streamlit binds its port, so Azure's 230s
 # container warmup probe succeeds before any slow DB connection can time it out.
+session = get_active_session()
 _initialize_genie_session()
 if "startup_db_check_done" not in st.session_state:
     st.session_state["startup_db_check_done"] = True
@@ -206,24 +207,15 @@ if "startup_db_check_done" not in st.session_state:
                 st.session_state["warehouse_setup_done"] = True
 
         if "validation_run" not in st.session_state:
-            # Mark immediately so reruns don't re-launch the thread
-            st.session_state["validation_run"] = True
             try:
-                import threading
                 from data_validation import run_all_validations
-
-                def _run_validation():
-                    try:
-                        results = run_all_validations(persist=True)
-                        passed = sum(1 for r in results if r.status == "PASS")
-                        failed = sum(1 for r in results if r.status == "FAIL")
-                        errors  = sum(1 for r in results if r.status == "ERROR")
-                        logger.info(f"Validation complete: {passed} passed, {failed} failed, {errors} errors")
-                    except Exception as _ve:
-                        logger.warning(f"Background validation failed: {_ve}")
-
-                _t = threading.Thread(target=_run_validation, daemon=True)
-                _t.start()
+                logger.info("Running startup data validation...")
+                validation_results = run_all_validations(persist=True)
+                st.session_state["validation_run"] = True
+                passed = sum(1 for r in validation_results if r.status == "PASS")
+                failed = sum(1 for r in validation_results if r.status == "FAIL")
+                errors  = sum(1 for r in validation_results if r.status == "ERROR")
+                logger.info(f"Validation complete: {passed} passed, {failed} failed, {errors} errors")
             except Exception as validation_error:
                 logger.warning(f"Data validation failed (non-blocking): {validation_error}")
 
@@ -778,12 +770,11 @@ def compute_range_preset(preset: str):
 def sql_date(d: date) -> str:
     return f"'{d.strftime('%Y-%m-%d')}'"
 
-@st.cache_data(ttl=300, show_spinner=False)
 def run_df(sql: str) -> pd.DataFrame:
-    """Execute SQL and return a DataFrame. Results are cached for 5 minutes (ttl=300)."""
     try:
         _sess = get_session()
         if not _sess:
+            st.error("Database session is not active. Please check the connection.")
             return pd.DataFrame()
         return _sess.sql(sql).to_pandas()
     except Exception as e:
@@ -3956,35 +3947,42 @@ if st.session_state.get('page','dashboard') == 'dashboard':
         st.error(f"Failed to generate insight: {e}")
 
 
-    # ----- KPI row (current vs prior) — single query, two periods -----
-    _kpi_combined = normalize_upper(run_df(f"""
+    # ----- KPI row (current vs prior) -----
+    kpi_cur = normalize_upper(run_df(f"""
     WITH base AS (
-      SELECT FACT.*, V.VENDOR_NAME,
-        CASE
-          WHEN POSTING_DATE BETWEEN {start_lit}   AND {end_lit}   THEN 'CUR'
-          WHEN POSTING_DATE BETWEEN {p_start_lit} AND {p_end_lit} THEN 'PREV'
-        END AS _period
+      SELECT FACT.*, V.VENDOR_NAME
       FROM {DB}.{SCHEMA}.fact_all_sources_vw FACT
       LEFT JOIN {DB}.{SCHEMA}.dim_vendor_vw V ON FACT.VENDOR_ID = V.VENDOR_ID
-      WHERE POSTING_DATE BETWEEN {p_start_lit} AND {end_lit}
+      WHERE POSTING_DATE BETWEEN {start_lit} AND {end_lit}
         {vendor_where}
     )
     SELECT
-      _period,
       COUNT(DISTINCT CASE WHEN UPPER(INVOICE_STATUS) = 'OPEN' THEN PURCHASE_ORDER_REFERENCE END) AS ACTIVE_POS,
       COUNT(DISTINCT PURCHASE_ORDER_REFERENCE) AS TOTAL_POS,
       SUM(CASE WHEN UPPER(INVOICE_STATUS) NOT IN ('CANCELLED','REJECTED')
                THEN COALESCE(INVOICE_AMOUNT_LOCAL,0) ELSE 0 END) AS TOTAL_SPEND,
       COUNT(DISTINCT VENDOR_NAME) AS ACTIVE_VENDORS,
       COUNT(DISTINCT CASE WHEN UPPER(INVOICE_STATUS) = 'OPEN' THEN INVOICE_NUMBER END) AS PENDING_INV
-    FROM base
-    WHERE _period IS NOT NULL
-    GROUP BY _period;
+    FROM base;
     """))
-    _kpi_cur_rows  = _kpi_combined[_kpi_combined["_PERIOD"] == "CUR"]
-    _kpi_prev_rows = _kpi_combined[_kpi_combined["_PERIOD"] == "PREV"]
-    kpi_cur  = _kpi_cur_rows.reset_index(drop=True)  if not _kpi_cur_rows.empty  else pd.DataFrame()
-    kpi_prev = _kpi_prev_rows.reset_index(drop=True) if not _kpi_prev_rows.empty else pd.DataFrame()
+
+    kpi_prev = normalize_upper(run_df(f"""
+    WITH base AS (
+      SELECT FACT.*, V.VENDOR_NAME
+      FROM {DB}.{SCHEMA}.fact_all_sources_vw FACT
+      LEFT JOIN {DB}.{SCHEMA}.dim_vendor_vw V ON FACT.VENDOR_ID = V.VENDOR_ID
+      WHERE POSTING_DATE BETWEEN {p_start_lit} AND {p_end_lit}
+        {vendor_where}
+    )
+    SELECT
+      COUNT(DISTINCT CASE WHEN UPPER(INVOICE_STATUS) = 'OPEN' THEN PURCHASE_ORDER_REFERENCE END) AS ACTIVE_POS,
+      COUNT(DISTINCT PURCHASE_ORDER_REFERENCE) AS TOTAL_POS,
+      SUM(CASE WHEN UPPER(INVOICE_STATUS) NOT IN ('CANCELLED','REJECTED')
+               THEN COALESCE(INVOICE_AMOUNT_LOCAL,0) ELSE 0 END) AS TOTAL_SPEND,
+      COUNT(DISTINCT VENDOR_NAME) AS ACTIVE_VENDORS,
+      COUNT(DISTINCT CASE WHEN UPPER(INVOICE_STATUS) = 'OPEN' THEN INVOICE_NUMBER END) AS PENDING_INV
+    FROM base;
+    """))
 
     cur_pos   = get_num(kpi_cur, 'ACTIVE_POS', 0)
     cur_total_pos = get_num(kpi_cur, 'TOTAL_POS', 0)
@@ -4053,7 +4051,7 @@ if st.session_state.get('page','dashboard') == 'dashboard':
 
     st.markdown("")  # spacer
 
-    # ----- Additional invoice process KPIs (2 queries instead of 6) -----
+    # ----- Additional invoice process KPIs -----
     avg_proc_days = 0.0
     fp_pct = 0.0
     ap_pct = 0.0
@@ -4061,84 +4059,106 @@ if st.session_state.get('page','dashboard') == 'dashboard':
     prev_fp_pct = 0.0
     prev_ap_pct = 0.0
     try:
-        # fact_all_sources_vw: proc time + first-pass — both periods in one query
-        proc_fp_combined_sql = f"""
-        WITH fact_base AS (
-          SELECT INVOICE_NUMBER, INVOICE_STATUS, POSTING_DATE, PAYMENT_DATE,
-            CASE
-              WHEN POSTING_DATE BETWEEN {start_lit}   AND {end_lit}   THEN 'CUR'
-              WHEN POSTING_DATE BETWEEN {p_start_lit} AND {p_end_lit} THEN 'PREV'
-            END AS _period
-          FROM {DB}.{SCHEMA}.fact_all_sources_vw
-          WHERE POSTING_DATE BETWEEN {p_start_lit} AND {end_lit}
-            {vendor_where}
-        )
+        proc_sql = f"""
         SELECT
-          _period,
-          AVG(CASE WHEN UPPER(INVOICE_STATUS) = 'PAID'
-                   THEN DATEDIFF(day, POSTING_DATE, PAYMENT_DATE) END) AS AVG_PROCESSING_DAYS
-        FROM fact_base
-        WHERE _period IS NOT NULL
-        GROUP BY _period;
+          AVG(DATEDIFF(day,
+              POSTING_DATE,
+              PAYMENT_DATE
+          )) AS AVG_PROCESSING_DAYS
+        FROM {DB}.{SCHEMA}.fact_all_sources_vw FACT
+        WHERE POSTING_DATE BETWEEN {start_lit} AND {end_lit}
+          {vendor_where}
+          AND UPPER(INVOICE_STATUS) = 'PAID';
         """
-        # invoice_status_history_vw: first-pass + auto-process — both periods in one query
-        hist_combined_sql = f"""
+        proc_prev_sql = f"""
+        SELECT
+          AVG(DATEDIFF(day,
+              POSTING_DATE,
+              PAYMENT_DATE
+          )) AS AVG_PROCESSING_DAYS
+        FROM {DB}.{SCHEMA}.fact_all_sources_vw FACT
+        WHERE POSTING_DATE BETWEEN {p_start_lit} AND {p_end_lit}
+          {vendor_where}
+          AND UPPER(INVOICE_STATUS) = 'PAID';
+        """
+        fp_sql = f"""
         WITH hist AS (
-          SELECT INVOICE_NUMBER, STATUS, STATUS_NOTES,
-            CASE
-              WHEN POSTING_DATE BETWEEN {start_lit}   AND {end_lit}   THEN 'CUR'
-              WHEN POSTING_DATE BETWEEN {p_start_lit} AND {p_end_lit} THEN 'PREV'
-            END AS _period
+          SELECT INVOICE_NUMBER,
+                 MAX(CASE WHEN UPPER(STATUS) IN ('PAID','CLEARED','CLOSED','POSTED','SETTLED') THEN 1 ELSE 0 END) AS HAS_PAID,
+                 MAX(CASE WHEN UPPER(STATUS) IN ('DISPUTE','DISPUTED','OVERDUE') THEN 1 ELSE 0 END) AS HAS_ISSUE
           FROM {DB}.{SCHEMA}.invoice_status_history_vw
-          WHERE POSTING_DATE BETWEEN {p_start_lit} AND {end_lit}
+          WHERE POSTING_DATE BETWEEN {start_lit} AND {end_lit}
             {build_vendor_where_history(vendor)}
-        ),
-        inv_agg AS (
-          SELECT _period, INVOICE_NUMBER,
-            MAX(CASE WHEN UPPER(STATUS) IN ('PAID','CLEARED','CLOSED','POSTED','SETTLED') THEN 1 ELSE 0 END) AS HAS_PAID,
-            MAX(CASE WHEN UPPER(STATUS) IN ('DISPUTE','DISPUTED','OVERDUE') THEN 1 ELSE 0 END) AS HAS_ISSUE,
-            MAX(CASE WHEN UPPER(STATUS) = 'PAID' THEN 1 ELSE 0 END) AS IS_PAID,
-            MAX(CASE WHEN UPPER(STATUS) = 'PAID' AND UPPER(STATUS_NOTES) = 'AUTO PROCESSED' THEN 1 ELSE 0 END) AS IS_AUTO
-          FROM hist
-          WHERE _period IS NOT NULL
-          GROUP BY _period, INVOICE_NUMBER
+          GROUP BY INVOICE_NUMBER
         )
         SELECT
-          _period,
           COUNT(*) AS TOTAL_INV,
-          SUM(CASE WHEN HAS_PAID = 1 AND HAS_ISSUE = 0 THEN 1 ELSE 0 END) AS FIRST_PASS_INV,
-          SUM(IS_PAID) AS TOTAL_CLEARED,
-          SUM(IS_AUTO) AS AUTO_PROCESSED
-        FROM inv_agg
-        GROUP BY _period;
+          SUM(CASE WHEN HAS_PAID = 1 AND HAS_ISSUE = 0 THEN 1 ELSE 0 END) AS FIRST_PASS_INV
+        FROM hist;
         """
+        fp_prev_sql = f"""
+        WITH hist AS (
+          SELECT INVOICE_NUMBER,
+                 MAX(CASE WHEN UPPER(STATUS) IN ('PAID','CLEARED','CLOSED','POSTED','SETTLED') THEN 1 ELSE 0 END) AS HAS_PAID,
+                 MAX(CASE WHEN UPPER(STATUS) IN ('DISPUTE','DISPUTED','OVERDUE') THEN 1 ELSE 0 END) AS HAS_ISSUE
+          FROM {DB}.{SCHEMA}.invoice_status_history_vw
+          WHERE POSTING_DATE BETWEEN {p_start_lit} AND {p_end_lit}
+            {build_vendor_where_history(vendor)}
+          GROUP BY INVOICE_NUMBER
+        )
+        SELECT
+          COUNT(*) AS TOTAL_INV,
+          SUM(CASE WHEN HAS_PAID = 1 AND HAS_ISSUE = 0 THEN 1 ELSE 0 END) AS FIRST_PASS_INV
+        FROM hist;
+        """
+        ap_sql = f"""
+        WITH PAID_INVOICES AS (
+            SELECT INVOICE_NUMBER,STATUS_NOTES
+            FROM {DB}.{SCHEMA}.invoice_status_history_vw
+            WHERE POSTING_DATE BETWEEN {start_lit} AND {end_lit}
+                {build_vendor_where_history(vendor)}
+                AND UPPER(STATUS) = 'PAID'
+        )
+        SELECT 
+            COUNT(*) AS TOTAL_CLEARED,
+            SUM(CASE WHEN UPPER(STATUS_NOTES) = 'AUTO PROCESSED' THEN 1 ELSE 0 END) AS AUTO_PROCESSED
+        FROM PAID_INVOICES;
+        """
+        ap_prev_sql = f"""
+        WITH PAID_INVOICES AS (
+            SELECT INVOICE_NUMBER,STATUS_NOTES
+            FROM {DB}.{SCHEMA}.invoice_status_history_vw
+            WHERE POSTING_DATE BETWEEN {p_start_lit} AND {p_end_lit}
+                {build_vendor_where_history(vendor)}
+                AND UPPER(STATUS) = 'PAID'
+        )
+        SELECT 
+            COUNT(*) AS TOTAL_CLEARED,
+            SUM(CASE WHEN UPPER(STATUS_NOTES) = 'AUTO PROCESSED' THEN 1 ELSE 0 END) AS AUTO_PROCESSED
+        FROM PAID_INVOICES;
+        """
+        
+        proc_df = normalize_upper(run_df(proc_sql))
+        proc_prev_df = normalize_upper(run_df(proc_prev_sql))
+        fp_df = normalize_upper(run_df(fp_sql))
+        fp_prev_df = normalize_upper(run_df(fp_prev_sql))
+        ap_df = normalize_upper(run_df(ap_sql))
+        ap_prev_df = normalize_upper(run_df(ap_prev_sql))
 
-        _pf = normalize_upper(run_df(proc_fp_combined_sql))
-        _hc = normalize_upper(run_df(hist_combined_sql))
-
-        def _row(df, period):
-            rows = df[df["_PERIOD"] == period]
-            return rows.reset_index(drop=True) if not rows.empty else pd.DataFrame()
-
-        _pf_cur  = _row(_pf, "CUR");  _pf_prev = _row(_pf, "PREV")
-        _hc_cur  = _row(_hc, "CUR");  _hc_prev = _row(_hc, "PREV")
-
-        avg_proc_days      = get_num(_pf_cur,  "AVG_PROCESSING_DAYS", 0)
-        prev_avg_proc_days = get_num(_pf_prev, "AVG_PROCESSING_DAYS", 0)
-
-        total_inv   = get_num(_hc_cur, "TOTAL_INV", 0)
-        first_pass  = get_num(_hc_cur, "FIRST_PASS_INV", 0)
-        fp_pct      = (first_pass / total_inv * 100.0) if total_inv > 0 else 0.0
-        prev_total_inv  = get_num(_hc_prev, "TOTAL_INV", 0)
-        prev_first_pass = get_num(_hc_prev, "FIRST_PASS_INV", 0)
-        prev_fp_pct     = (prev_first_pass / prev_total_inv * 100.0) if prev_total_inv > 0 else 0.0
-
-        total_paid  = get_num(_hc_cur, "TOTAL_CLEARED", 0)
-        auto_proc   = get_num(_hc_cur, "AUTO_PROCESSED", 0)
-        ap_pct      = (auto_proc / total_paid * 100.0) if total_paid > 0 else 0.0
-        prev_total_paid = get_num(_hc_prev, "TOTAL_CLEARED", 0)
-        prev_auto_proc  = get_num(_hc_prev, "AUTO_PROCESSED", 0)
-        prev_ap_pct     = (prev_auto_proc / prev_total_paid * 100.0) if prev_total_paid > 0 else 0.0
+        avg_proc_days = get_num(proc_df, "AVG_PROCESSING_DAYS", 0)
+        prev_avg_proc_days = get_num(proc_prev_df, "AVG_PROCESSING_DAYS", 0)
+        total_inv = get_num(fp_df, "TOTAL_INV", 0)
+        first_pass = get_num(fp_df, "FIRST_PASS_INV", 0)
+        fp_pct = (first_pass / total_inv * 100.0) if total_inv > 0 else 0.0
+        prev_total_inv = get_num(fp_prev_df, "TOTAL_INV", 0)
+        prev_first_pass = get_num(fp_prev_df, "FIRST_PASS_INV", 0)
+        prev_fp_pct = (prev_first_pass / prev_total_inv * 100.0) if prev_total_inv > 0 else 0.0
+        total_paid = get_num(ap_df, "TOTAL_CLEARED", 0)
+        auto_proc = get_num(ap_df, "AUTO_PROCESSED", 0)
+        ap_pct = (auto_proc/total_paid * 100.0) if total_paid > 0 else 0.0
+        prev_total_paid = get_num(ap_prev_df, "TOTAL_CLEARED", 0)
+        prev_auto_proc = get_num(ap_prev_df, "AUTO_PROCESSED", 0)
+        prev_ap_pct = (prev_auto_proc/prev_total_paid * 100.0) if prev_total_paid > 0 else 0.0
 
     except Exception as e:
         st.error(f"Failed to compute invoice processing KPIs: {e}")
