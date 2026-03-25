@@ -36,7 +36,45 @@ from db_service import get_active_session, run_df, execute_query, execute_non_qu
 from llm_service_full import generate_sql, cortex_complete, generate_prescriptive_insights, generate_ai_invoice_suggestion
 import altair as alt
 import urllib.parse
-from db_service import cache_get, cache_set
+from db_service import cache_get as _db_cache_get, cache_set as _db_cache_set
+
+def cache_get(question: str):
+    """
+    Wrapper around db_service.cache_get that deserialises the stored JSON
+    payload back into the dict structure app.py expects:
+      { "sql": <str>, "result_json": <JSON string> }
+    Returns None if there is no cache hit or the payload cannot be parsed.
+    """
+    try:
+        import json as _json
+        raw = _db_cache_get(question)
+        if not raw:
+            return None
+        # db_service may return the raw string or already a dict
+        if isinstance(raw, dict):
+            return raw
+        return _json.loads(raw)
+    except Exception:
+        return None
+
+def cache_set(question: str, sql: str, result_df) -> None:
+    """
+    Wrapper around db_service.cache_set that serialises the DataFrame into
+    the dict structure that cache_get() expects:
+      { "sql": <str>, "result_json": <JSON string> }
+    db_service.cache_set(key, value) takes exactly 2 positional arguments.
+    """
+    try:
+        import json as _json
+        payload = {
+            "sql": sql,
+            "result_json": result_df.to_json(orient="records", date_format="iso")
+            if result_df is not None and not result_df.empty
+            else "[]",
+        }
+        _db_cache_set(question, _json.dumps(payload))
+    except Exception as _ce:
+        logger.warning(f"cache_set wrapper failed: {_ce}")
 from warehouse_setup import ensure_warehouse_tables
 session = get_active_session()
 
@@ -1927,7 +1965,7 @@ def branding_bar():
     # Full header with columns
     header_cols = st.columns([1, 2, 1])
     
-    # Left: Title (ProcureSpendIQ)
+    # Left: Title (ProcureIQ)
     with header_cols[0]:
         st.markdown(
             "<div style='display:flex;align-items:center;gap:12px;padding:8px 0;min-height:52px;'>"
@@ -4723,7 +4761,6 @@ if st.session_state.get('page') == 'genie':
         
         #CACHE THE RESULT - Save to QUERY_RESULT_CACHE warehouse table
         try:
-            from db_service import cache_set
             if isinstance(response, dict) and 'message' in response:
                 # Extract SQL from response structure
                 result_sql = ''
@@ -4770,7 +4807,7 @@ if st.session_state.get('page') == 'genie':
     # Welcome Header
     st.markdown("""
     <div style="margin-bottom:8px;">
-        <h1 style="font-size:28px;font-weight:900;color:#1a1a1a;margin:0 0 4px 0;">Welcome to ProcureSpendIQGenie</h1>
+        <h1 style="font-size:28px;font-weight:900;color:#1a1a1a;margin:0 0 4px 0;">Welcome to ProcureIQ Genie</h1>
         <p style="font-size:16px;color:#64748b;margin:0;">LetGenie run one of these quick analyses for you</p>
     </div>
     """, unsafe_allow_html=True)
