@@ -100,7 +100,9 @@ def save_query_to_session_memory(question: str, sql: str, result_summary: str):
     if len(st.session_state.genie_queries) > 5:
         st.session_state.genie_queries = st.session_state.genie_queries[-5:]
     logger.info(f"Query saved to session memory: {question[:50]}")
+save_query_to_database(question, sql, result_summary)
 
+load_previous_sessions_from_database()
 
 def archive_session_to_longterm_memory(session_summary: str = ""):
     """Move current session to long-term memory."""
@@ -142,7 +144,56 @@ def get_session_context_for_prompt() -> str:
             context += f"- {q['question']}\n"
         context += "\n---\n\n"
     return context
+def save_query_to_database(question: str, sql: str, result_summary: str):
+    """Persist query to database."""
+    try:
+        from db_service import execute_non_query
+        insert_sql = """
+        INSERT INTO dbo.genie_session_history 
+            (session_id, user_id, action_type, action_details, query_text, query_result_summary)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """
+        execute_non_query(insert_sql, [
+            st.session_state.get("genie_session_id"),
+            1,
+            "QUERY",
+            json.dumps({"question": question}),
+            sql,
+            result_summary
+        ])
+    except Exception as e:
+        logger.warning(f"Database save failed: {e}")
 
+# Function 2: Load from database
+def load_previous_sessions_from_database():
+    """Load previous sessions from database."""
+    try:
+        from db_service import run_df
+        df = run_df("""
+        SELECT TOP 5 session_id, COUNT(*) as query_count,
+               MIN(created_at) as session_start
+        FROM dbo.genie_session_history
+        WHERE user_id = ? AND is_active = 1
+        GROUP BY session_id
+        ORDER BY session_start DESC
+        """, [1])
+        if not df.empty:
+            st.session_state.genie_previous_sessions = df.to_dict('records')
+    except Exception as e:
+        logger.warning(f"Session load failed: {e}")
+
+
+
+# Function 4: Pagination display
+def render_paginated_df(df):
+    """Display large dataframes with pagination."""
+    if len(df) > 100:
+        page = st.number_input("Page", min_value=1)
+        per_page = st.selectbox("Rows", [50, 100, 200])
+        start = (page-1)*per_page
+        st.dataframe(df.iloc[start:start+per_page])
+    else:
+        st.dataframe(df)
 
 def _extract_key_topics(queries: list) -> list:
     """Extract key topics from list of queries."""
@@ -165,6 +216,25 @@ def _extract_key_topics(queries: list) -> list:
             if keyword in question_lower:
                 topics.add(topic)
     return list(topics)[:3]
+def run_df_paginated(sql: str, page: int = 1, per_page: int = 100) -> tuple:
+    """Pagination for large datasets - prevents freezing."""
+    try:
+        total_sql = f"SELECT COUNT(*) as cnt FROM ({sql}) as _total"
+        total_df = run_df(total_sql)
+        total_count = int(total_df.iloc[0]['cnt']) if not total_df.empty else 0
+    except:
+        total_count = 0
+    
+    offset = (page - 1) * per_page
+    paginated_sql = f"""
+        SELECT * FROM ({sql}) as _paginated
+        ORDER BY (SELECT NULL)
+        OFFSET {offset} ROWS
+        FETCH NEXT {per_page} ROWS ONLY
+    """
+    
+    df = run_df(paginated_sql)
+    return df, {"page": page, "per_page": per_page, "total": total_count}
 
 
 def display_session_history_sidebar():
