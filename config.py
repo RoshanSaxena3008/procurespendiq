@@ -195,10 +195,10 @@ class Config:
     # ------------------------------------------------------------------
     _ui = _settings.get("ui", {})
 
-    APP_TITLE: str        = _ui.get("app_title", "ProcureIQ Analytics")
+    APP_TITLE: str        = _ui.get("app_title", "ProcureSpendIQ Analytics")
     PAGE_ICON_URL: str    = _ui.get("page_icon_url", "")
     DEFAULT_BG_COLOR: str = _ui.get("default_bg_color", "#FBF9F4")
-    BRAND_NAME: str       = _ui.get("brand_name", "ProcureIQ")
+    BRAND_NAME: str       = _ui.get("brand_name", "ProcureSpendIQ")
     SUPPORT_EMAIL: str    = _ui.get("support_email", "")
     APP_REGION: str       = _ui.get("region", "eastus")
 
@@ -304,7 +304,7 @@ class Config:
     @classmethod
     def print_diagnostics(cls) -> None:
         """Print masked config values to the terminal for quick troubleshooting."""
-        print("\n=== ProcureIQ Configuration Diagnostics ===")
+        print("\n=== ProcureSpendIQ Configuration Diagnostics ===")
         for line in cls.validate_connection_values():
             print(" ", line)
         missing = [
