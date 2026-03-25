@@ -121,10 +121,13 @@ def load_schema_from_yaml(yaml_path: str | None = None) -> str:
 
     prompt += textwrap.dedent("""
         RULES:
-        1. Use fully qualified names: schema.table
-        2. Only SELECT queries
-        3. T-SQL: TOP N, DATETRUNC, GETDATE
-        4. Return ONLY SQL
+        1. Use fully qualified names: schema.table AND table.column
+        2. ALWAYS qualify ALL columns with table alias (e.g., f.VENDOR_ID, v.VENDOR_NAME)
+        3. In GROUP BY, HAVING, WHERE: ALWAYS use table.column format
+        4. Only SELECT queries
+        5. T-SQL: TOP N, DATETRUNC, GETDATE
+        6. Return ONLY SQL
+        7. CRITICAL: Never use unqualified column names when multiple tables are joined
     """)
 
     return prompt.replace("{schema}", Config.SCHEMA)
