@@ -1965,7 +1965,7 @@ def branding_bar():
     # Full header with columns
     header_cols = st.columns([1, 2, 1])
     
-    # Left: Title (ProcureSpendIQ)
+    # Left: Title (ProcureIQ)
     with header_cols[0]:
         st.markdown(
             "<div style='display:flex;align-items:center;gap:12px;padding:8px 0;min-height:52px;'>"
@@ -4807,7 +4807,7 @@ if st.session_state.get('page') == 'genie':
     # Welcome Header
     st.markdown("""
     <div style="margin-bottom:8px;">
-        <h1 style="font-size:28px;font-weight:900;color:#1a1a1a;margin:0 0 4px 0;">Welcome to (ProcureSpendIQ)Genie</h1>
+        <h1 style="font-size:28px;font-weight:900;color:#1a1a1a;margin:0 0 4px 0;">Welcome to ProcureIQ Genie</h1>
         <p style="font-size:16px;color:#64748b;margin:0;">LetGenie run one of these quick analyses for you</p>
     </div>
     """, unsafe_allow_html=True)
