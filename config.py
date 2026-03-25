@@ -1,9 +1,4 @@
-"""
-Configuration settings for ProcureSpendIQ Analytics
-Secrets are sourced from Azure Key Vault. All UI strings and
-operational tunables are loaded from app_settings.yaml so that
-the codebase never contains hard-coded values.
-"""
+
 
 import os
 import yaml
@@ -172,19 +167,38 @@ class Config:
     AZURE_KEY_VAULT_URL: str = os.getenv("AZURE_KEY_VAULT_URL", "")
 
     # ------------------------------------------------------------------
-    # AI model alias used for prescriptive insights
+    # AI model aliases and generation settings
     # ------------------------------------------------------------------
-    PRESCRIPTIVE_MODEL: str = AZURE_OPENAI_DEPLOYMENT
+    # Model used for natural-language → SQL generation
+    SQL_MODEL: str = _vault.get(
+        "SQL_MODEL",
+        _settings.get("ai", {}).get("sql_model", AZURE_OPENAI_DEPLOYMENT),
+    ) or AZURE_OPENAI_DEPLOYMENT
+
+    # Model used for prescriptive / narrative completions
+    PRESCRIPTIVE_MODEL: str = _vault.get(
+        "PRESCRIPTIVE_MODEL",
+        _settings.get("ai", {}).get("prescriptive_model", AZURE_OPENAI_DEPLOYMENT),
+    ) or AZURE_OPENAI_DEPLOYMENT
+
+    # Temperature for SQL generation — 0.0 keeps queries deterministic
+    SQL_GENERATION_TEMPERATURE: float = float(
+        _vault.get(
+            "SQL_GENERATION_TEMPERATURE",
+            str(_settings.get("ai", {}).get("sql_generation_temperature", 0.0)),
+        )
+        or 0.0
+    )
 
     # ------------------------------------------------------------------
     # Application UI strings loaded from app_settings.yaml (req 10, 12)
     # ------------------------------------------------------------------
     _ui = _settings.get("ui", {})
 
-    APP_TITLE: str        = _ui.get("app_title", "ProcureSpendIQ Analytics")
+    APP_TITLE: str        = _ui.get("app_title", "ProcureIQ Analytics")
     PAGE_ICON_URL: str    = _ui.get("page_icon_url", "")
     DEFAULT_BG_COLOR: str = _ui.get("default_bg_color", "#FBF9F4")
-    BRAND_NAME: str       = _ui.get("brand_name", "ProcureSpendIQ")
+    BRAND_NAME: str       = _ui.get("brand_name", "ProcureIQ")
     SUPPORT_EMAIL: str    = _ui.get("support_email", "")
     APP_REGION: str       = _ui.get("region", "eastus")
 
@@ -290,7 +304,7 @@ class Config:
     @classmethod
     def print_diagnostics(cls) -> None:
         """Print masked config values to the terminal for quick troubleshooting."""
-        print("\n=== ProcureSpendIQ Configuration Diagnostics ===")
+        print("\n=== ProcureIQ Configuration Diagnostics ===")
         for line in cls.validate_connection_values():
             print(" ", line)
         missing = [
