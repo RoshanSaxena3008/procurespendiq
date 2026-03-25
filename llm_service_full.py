@@ -155,10 +155,14 @@ def _clean_sql(raw: str) -> str:
 def generate_sql(user_question: str, temperature: float | None = None) -> str:
     """Convert natural language to T-SQL query (cache-first)."""
     cache_key = f"sql_cache:{user_question}"
-    cached = cache_get(cache_key)
-    if cached:
+    _cached = cache_get(cache_key)
+    if _cached:
         logger.info("SQL cache hit")
-        return cached
+        # db_service.cache_get returns a dict; the SQL is stored in the 'sql' key.
+        # Guard against the old plain-string format for backwards compatibility.
+        if isinstance(_cached, dict):
+            return _cached.get("sql") or ""
+        return str(_cached)
 
     temp = temperature or Config.SQL_GENERATION_TEMPERATURE
     try:
@@ -180,7 +184,9 @@ def generate_sql(user_question: str, temperature: float | None = None) -> str:
     if not re.match(r"^\s*(SELECT|WITH)\s+", sql, re.IGNORECASE):
         sql = "SELECT 'Please ask a specific question.' AS MESSAGE"
 
-    cache_set(cache_key, sql)
+    # db_service.cache_set requires (question, sql, result_df).
+    # For SQL-string caching there is no result DataFrame, so pass an empty one.
+    cache_set(cache_key, sql, pd.DataFrame())
     return sql
 
 
@@ -203,11 +209,6 @@ def cortex_complete(
       Issue #3: All emojis removed from output
     """
     try:
-        # Ensure prompt is always a non-empty string — Azure OpenAI rejects None or ""
-        if not isinstance(prompt, str) or not prompt.strip():
-            logger.warning("cortex_complete called with empty/invalid prompt")
-            return ""
-
         full_prompt = prompt
 
         # Optional memory context (Issue #2)
@@ -243,7 +244,7 @@ def cortex_complete(
 
         response = _client.chat.completions.create(
             model=model or Config.PRESCRIPTIVE_MODEL,
-            messages=[{"role": "user", "content": full_prompt or prompt}],
+            messages=[{"role": "user", "content": full_prompt}],
             temperature=temperature,
         )
 
